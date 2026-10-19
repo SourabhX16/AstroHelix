@@ -16,12 +16,12 @@
 
 ### Frontend (2 files modified/created)
 
-3. **`frontend2/components/moving-satellite.tsx`** (NEW)
+3. **`frontend/components/moving-satellite.tsx`** (NEW)
    - React Three.js component that animates a satellite along its trajectory
    - Shows the satellite as a red sphere moving in real-time
    - Displays an orbital trail showing the full path
 
-4. **`frontend2/components/globe-view.tsx`** (MODIFIED)
+4. **`frontend/components/globe-view.tsx`** (MODIFIED)
    - Fetches trajectory from the backend
    - Renders the `MovingSatellite` component
    - Now shows: Earth + Mock satellites + YOUR moving satellite (red)
@@ -154,7 +154,7 @@ astro-helix/
 ├── engine/
 │   └── models/
 │       └── satellite.py                 # ← Your original Satellite class
-└── frontend2/
+└── frontend/
     └── components/
         ├── globe-view.tsx               # ← Modified (added MovingSatellite)
         └── moving-satellite.tsx         # ← NEW (animation component)

@@ -12,8 +12,8 @@ Usage:
     # With demo data
     python -m agents.run --demo "Analyze threats for ISS and recommend avoidance maneuvers"
 
-    # Custom Nemotron endpoint
-    python -m agents.run --base-url http://gx10:8001/v1 "Scan for threats"
+    # Custom OpenAI-compatible endpoint
+    python -m agents.run --base-url http://localhost:8001/v1 "Scan for threats"
 """
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def main():
     except Exception as e:
         print(f"\n❌ Error: {e}")
         print(f"\nIs vLLM running at {config.base_url}?")
-        print(f"  Start with: ./scripts/setup_gx10.sh")
+        print(f"  Optional future-scope setup: ./scripts/setup_gx10.sh")
         print(f"  Or set NEMOTRON_BASE_URL in .env")
         sys.exit(1)
 

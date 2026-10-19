@@ -1,12 +1,14 @@
-# Astro Helix — On-Board AI Agents Saving Satellites from Orbital Debris
+# Astro Helix — Multi-Agent Satellite Collision Avoidance Simulation
 
-Astro Helix is an autonomous collision-avoidance system that runs **on-board** a satellite using NVIDIA's Nemotron LLM on the ASUS Ascent GX10 (Grace Blackwell). A multi-agent LangGraph pipeline detects debris threats, assesses risk, plans maneuvers, validates safety constraints, and executes avoidance burns — all locally with zero ground-station latency.
+Astro Helix is a software simulation of an autonomous collision-avoidance pipeline for satellites. It combines a Python orbital physics engine, a LangGraph multi-agent workflow, a FastAPI service, and a Next.js dashboard. The agents screen a demo orbital catalog, assess conjunction risk, propose and simulate avoidance maneuvers, check resource constraints, and produce an operator brief. Maneuvers update only the simulated satellite state; no commands are sent to a real spacecraft.
+
+The current project is a software-only simulation designed to run on a development machine. Deployment to on-board hardware such as an ASUS Ascent GX10 / DGX Spark-class system is future scope.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    ASUS Ascent GX10 (On-Board)                   │
+│        On-board compute (target deployment, future scope)        │
 │                                                                  │
 │  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  ┌──────┐ │
 │  │  SCOUT  │→ │ ANALYST  │→ │ PLANNER  │→ │ SAFETY │→ │ OPS  │ │
@@ -34,22 +36,22 @@ Astro Helix is an autonomous collision-avoidance system that runs **on-board** a
 | Component | Path | Description |
 |-----------|------|-------------|
 | **Agent Pipeline** | `agents/` | LangGraph 5-agent pipeline with tool-calling |
-| **Physics Engine** | `engine/` | RK4 solver, J2 perturbation, CW dynamics, Chan collision probability |
-| **Satellite Model** | `engine/models/active_satellite.py` | Full orbital dynamics with resource management (fuel, power, battery) |
-| **Tool Wrappers** | `agents/tools.py` | 11 LangChain tools wrapping the physics engine |
-| **API** | `api/` | FastAPI server with agent, catalog, conjunction, and satellite endpoints |
-| **Frontend** | `frontend/` | Next.js + React Three Fiber 3D globe with live satellite tracking |
-| **Ascent GX10 Setup** | `scripts/setup_gx10.sh` | One-command setup for the ASUS Ascent GX10 |
+| **Physics Engine** | `engine/` | RK4/RK45 propagation, perturbation models, CW dynamics, Chan collision probability |
+| **Satellite Model** | `engine/models/active_satellite.py` | Simulated orbital state with resource management (fuel, power, battery) |
+| **Tool Wrappers** | `agents/tools.py` | 12 LangChain tools wrapping the physics engine and in-memory state |
+| **API** | `api/` | FastAPI service for agent execution, SSE streaming, demo reset, health, and status |
+| **Frontend** | `frontend/` | Next.js + React Three Fiber dashboard with a 3D globe and TLE-based orbital data routes |
+| **Optional hardware setup** | `scripts/setup_gx10.sh` | Optional future-scope vLLM setup for GX10 / DGX Spark-class hardware |
 
 ## Agent Pipeline
 
 | Agent | Role | Tools |
 |-------|------|-------|
-| **Scout** | Scan catalog for upcoming conjunctions, triage by severity | `scan_conjunctions`, `scan_demo_conjunctions` |
-| **Analyst** | Deep risk assessment — Chan probability, high-fidelity TCA refinement | `assess_risk`, `refine_conjunction`, `propagate_orbit` |
-| **Planner** | Design avoidance maneuvers considering satellite resources | `propose_avoidance_maneuvers`, `simulate_maneuver`, `get_satellite_status`, `check_maneuver_feasibility` |
-| **Safety** | Validate constraints, approve or reject, execute approved burns | `check_maneuver_constraints`, `get_satellite_status`, `check_maneuver_feasibility`, `execute_maneuver_on_satellite` |
-| **Ops Brief** | Generate human-readable summary for operators | _(synthesis only)_ |
+| **Scout** | Scan catalog for upcoming conjunctions, triage by severity | `get_pending_cdms`, `scan_conjunctions`, `scan_demo_conjunctions` |
+| **Analyst** | Deep risk assessment — Chan probability, high-fidelity TCA refinement | `get_pending_cdms`, `scan_conjunctions`, `scan_demo_conjunctions`, `assess_risk`, `refine_conjunction_hifi` |
+| **Planner** | Design avoidance maneuvers considering satellite resources | `propose_avoidance_maneuvers`, `simulate_maneuver_effect`, `assess_risk` |
+| **Safety** | Validate constraints and check maneuver feasibility | `get_satellite_status`, `check_maneuver_constraints`, `check_maneuver_feasibility`, `propagate_satellite_orbit` |
+| **Ops Brief** | Apply the approved simulated burn and produce an operator summary | `assess_risk`, `execute_maneuver_on_satellite`, `get_satellite_status`, `propagate_satellite_orbit` |
 
 ## Quick Start
 
@@ -69,10 +71,10 @@ npm install
 npm run dev  # localhost:3000
 ```
 
-### 3. Agent System (with Ascent GX10)
+### 3. Agent System (optional future-scope hardware)
 
 ```bash
-# Start Nemotron on the Ascent GX10
+# Optional: start a local model endpoint for future-scope hardware
 chmod +x scripts/setup_gx10.sh
 ./scripts/setup_gx10.sh
 
@@ -80,10 +82,10 @@ chmod +x scripts/setup_gx10.sh
 python -m agents.run "Scan for conjunction threats to satellite 25544 in the next 48 hours" --demo
 ```
 
-### 4. Agent System (without GPU — dev mode)
+### 4. Agent System (development mode, no local GPU)
 
 ```bash
-# Set OPENAI fallback in .env
+# Set an OpenAI-compatible endpoint in .env
 NEMOTRON_BASE_URL=https://api.openai.com/v1
 NEMOTRON_API_KEY=sk-...
 NEMOTRON_MODEL=gpt-4o-mini
@@ -93,24 +95,20 @@ python -m agents.run "Scan for threats" --demo
 
 ## Model
 
-**nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4** — 4-bit quantized (NVFP4) for fast edge inference on the Ascent GX10. ~15GB model weight footprint, leaving ample memory for KV cache and concurrent requests on the 128GB unified memory Grace Blackwell SoC.
+The agent layer uses an OpenAI-compatible chat endpoint. The repository includes configuration for `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` and an optional vLLM setup script for a future-scope on-board GX10 / DGX Spark-class deployment. The simulation can also run against any OpenAI-compatible endpoint; no on-board hardware is required.
 
-Served locally via NGC vLLM container with tool-calling (`--enable-auto-tool-choice --tool-call-parser hermes --enable-chunked-prefill`).
+## Why Simulate This Pipeline?
 
-## Why Edge AI?
+- **Reproducible scenarios:** the API loads a demo debris catalog, and the tools operate on in-memory orbital state.
+- **Inspectable decisions:** the pipeline emits SSE events, intermediate agent outputs, and a final operator brief.
+- **Modular physics:** screening, risk assessment, maneuver planning, propagation, and constraint checks live in separate Python modules.
+- **Safe experimentation:** maneuvers update only the simulated satellite model; no commands are sent to a real spacecraft.
 
-| Ground Station | On-Board (Astro Helix) |
-|---------------|-------------------|
-| 5-15 min communication delay | **< 1 sec** decision |
-| Limited pass windows | **24/7** monitoring |
-| Single point of failure | **Autonomous** operation |
-| Manual operator in the loop | **Agent-validated** decisions |
-
-In LEO, a debris collision can happen in minutes. You can't wait for the next ground station pass.
+An on-board deployment is future scope and is not implemented or tested in this repository.
 
 ## Team
 
-- **Justyna** — Frontend, 3D Visualization, UI/UX
-- **Ethan** — ASUS Ascent GX10 Setup, Simulation Logic
-- **Adit** — Satellite Data Feed, Simulation Logic
-- **Keanu** — Ascent GX10 vLLM Setup, LangChain NVIDIA Nemotron Agent System
+- <name> — <role>
+- <name> — <role>
+- <name> — <role>
+- <name> — <role>

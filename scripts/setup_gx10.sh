@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────
-# Astro Helix — GX10 / DGX Spark Setup Script
+# Astro Helix — Optional Future-Scope GX10 / DGX Spark Setup Script
 #
-# Serves NVIDIA Nemotron via vLLM on the GX10 (GB10, aarch64).
-# Default mode uses the NGC Docker container (CUDA Forward Compat).
+# This optional helper serves an NVIDIA Nemotron model via vLLM on future-scope
+# on-board hardware (GX10 / DGX Spark-class, GB10, aarch64). It is not required
+# for the software simulation. Default mode uses the NGC Docker container
+# (CUDA Forward Compat).
 #
 # Usage:
 #   chmod +x scripts/setup_gx10.sh
@@ -35,7 +37,7 @@ MODE_LABEL="Docker (NGC container)"
 if ! $USE_DOCKER; then MODE_LABEL="bare-metal (pip)"; fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Astro Helix — GX10 Nemotron Setup"
+echo "  Astro Helix — Optional GX10 Nemotron Setup (future scope)"
 echo "  Mode:        ${MODE_LABEL}"
 echo "  Model:       ${MODEL}"
 echo "  Port:        ${PORT}"

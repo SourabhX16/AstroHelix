@@ -1,8 +1,8 @@
 """
 Astro Helix Agents — Multi-agent collision avoidance orchestrator.
 
-Uses NVIDIA Nemotron (served via vLLM on the GX10) with LangGraph
-for multi-agent tool-calling workflows.
+Uses an OpenAI-compatible LLM endpoint with LangGraph for multi-agent
+tool-calling workflows.
 
 Architecture:
   ┌─────────┐     ┌──────────┐     ┌─────────┐     ┌────────┐     ┌───────┐

@@ -1,6 +1,6 @@
 # Astro Helix Agent Pipeline
 
-Sequential 5-agent collision avoidance pipeline running on-board via LangGraph.
+Sequential 5-agent collision avoidance pipeline implemented with LangGraph.
 
 ```
 Scout → Analyst → Planner → Safety → Ops Brief → END

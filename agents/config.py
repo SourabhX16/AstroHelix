@@ -2,28 +2,13 @@
 LLM configuration for the Astro Helix agent system.
 
 Supports three modes:
-  1. LOCAL  — Nemotron on the GX10 via NGC vLLM container (primary, for NVIDIA prize)
+  1. LOCAL  — OpenAI-compatible local endpoint (target deployment)
   2. NIM    — NVIDIA API Catalog / NIM endpoint (fallback)
   3. OPENAI — OpenAI-compatible endpoint (dev/testing)
 
-The GX10 (Grace Blackwell, 128GB unified memory) runs:
-  - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 (~15GB, 4-bit quantized)
-  - Served via bare-metal vLLM + flashinfer: ./scripts/setup_gx10.sh
-
-Start with:
-  ./scripts/setup_gx10.sh   # bare-metal with flashinfer (recommended)
-  # or manually:
-  pip install flashinfer vllm
-  vllm serve nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 \\
-      --trust-remote-code \\
-      --max-model-len 8192 \\
-      --gpu-memory-utilization 0.90 \\
-      --dtype auto \\
-      --enforce-eager \\
-      --enable-auto-tool-choice \\
-      --tool-call-parser hermes \\
-      --enable-chunked-prefill \\
-      --port 8001
+The optional scripts/setup_gx10.sh helper describes one possible future-scope
+on-board deployment on GX10 / DGX Spark-class hardware. It is not required
+for the software simulation.
 """
 from __future__ import annotations
 
