@@ -6,7 +6,11 @@ export const metadata: Metadata = {
   title: "Astro Helix",
   description: "Autonomous debris avoidance dashboard",
   icons: {
-    icon: "/favicon.png",
+    icon: [
+      { url: "/favicon-32.png", sizes: "32x32" },
+      { url: "/favicon-192.png", sizes: "192x192" },
+    ],
+    apple: "/apple-touch-icon.png",
   },
 }
 

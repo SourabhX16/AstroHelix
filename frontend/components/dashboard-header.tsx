@@ -60,10 +60,10 @@ export function DashboardHeader({
     <header className="w-full rounded-xl border border-border/80 bg-card/80 px-6 py-3 shadow-sm backdrop-blur-md">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <Image
-          src="/de.png"
-          alt="Astro Helix logo"
-          width={180}
-          height={56}
+          src="/astro-helix-wordmark.png"
+          alt="Astro Helix"
+          width={166}
+          height={40}
           priority
           className="h-10 w-auto"
         />
