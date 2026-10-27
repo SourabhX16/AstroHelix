@@ -15,6 +15,7 @@ from engine.config.settings import GM, RE, COLLISION_RADIUS
 from engine.physics.chan_probability import chan_collision_probability
 from engine.physics.entity import Entity
 from engine.physics.state import State
+from tools.screening import propagate_state, screen_conjunctions
 
 logger = logging.getLogger("astro_helix.tools.risk")
 
@@ -27,6 +28,7 @@ def assess_conjunction_risk(
     covariance_diag: Optional[list] = None,
     miss_distance_m: Optional[float] = None,
     collision_radius: float = COLLISION_RADIUS,
+    tca_offset_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Compute detailed risk assessment for a conjunction event.
@@ -48,14 +50,30 @@ def assess_conjunction_risk(
     s_pos = np.array(secondary_pos, dtype=float)
     s_vel = np.array(secondary_vel, dtype=float)
 
-    # Relative state
-    rel_pos = s_pos - p_pos
-    rel_vel = s_vel - p_vel
+    if tca_offset_sec is None:
+        events = screen_conjunctions(
+            primary_pos=p_pos,
+            primary_vel=p_vel,
+            debris_list=[{"position": s_pos, "velocity": s_vel}],
+            lookahead_sec=86400.0,
+            threshold_km=50000.0,
+        )
+        tca_sec = float(events[0]["tca_offset_sec"]) if events else 0.0
+    else:
+        tca_sec = float(tca_offset_sec)
+    primary_tca = propagate_state(p_pos, p_vel, tca_sec, dt=1.0)
+    secondary_tca = propagate_state(s_pos, s_vel, tca_sec, dt=1.0)
+    rel_pos = secondary_tca.r - primary_tca.r
+    rel_vel = secondary_tca.v - primary_tca.v
     dist = float(np.linalg.norm(rel_pos))
     rel_speed = float(np.linalg.norm(rel_vel))
 
-    if miss_distance_m is not None:
-        dist = miss_distance_m
+    if miss_distance_m is not None and dist > 0 and abs(float(miss_distance_m) - dist) / dist > 0.1:
+        logger.warning(
+            "Supplied miss distance %.1f m differs from propagated TCA miss %.1f m; using propagated value",
+            miss_distance_m,
+            dist,
+        )
 
     # Build covariance matrix
     if covariance_diag is not None:
@@ -66,6 +84,7 @@ def assess_conjunction_risk(
         cov = np.diag([sigma**2, sigma**2, sigma**2])
 
     # Chan collision probability
+    chan_status = "ok"
     try:
         poc = chan_collision_probability(
             rel_pos=rel_pos,
@@ -77,8 +96,9 @@ def assess_conjunction_risk(
         logger.warning("Chan PoC failed, using Gaussian fallback: %s", e)
         sigma_eff = np.sqrt(np.trace(cov) / 3.0)
         poc = float(np.exp(-0.5 * (dist / max(sigma_eff, 1.0)) ** 2))
+        chan_status = "fallback"
 
-    # Gaussian fallback probability
+    # Crude distance likelihood for display; it is not a collision probability.
     sigma_eff = np.sqrt(np.trace(cov) / 3.0)
     gaussian_prob = float(np.exp(-0.5 * (dist / max(sigma_eff, 1.0)) ** 2))
 
@@ -91,14 +111,14 @@ def assess_conjunction_risk(
     risk_score = 0.5 * poc_score + 0.3 * dist_score + 0.2 * vel_score
     risk_score = max(0.0, min(1.0, risk_score))
 
-    # Risk classification
-    if risk_score > 0.7 or poc > 1e-4 or dist < 500:
+    # Risk classification is based on the Chan collision probability.
+    if poc > 1e-4:
         risk_level = "critical"
         recommendation = "IMMEDIATE maneuver required"
-    elif risk_score > 0.4 or poc > 1e-5 or dist < 2000:
+    elif poc > 1e-5:
         risk_level = "high"
         recommendation = "Plan avoidance maneuver"
-    elif risk_score > 0.2 or poc > 1e-6 or dist < 5000:
+    elif poc > 1e-6:
         risk_level = "medium"
         recommendation = "Monitor closely, prepare contingency"
     else:
@@ -110,6 +130,8 @@ def assess_conjunction_risk(
         "relative_velocity_ms": round(rel_speed, 1),
         "collision_probability_chan": float(f"{poc:.2e}"),
         "collision_probability_gaussian": float(f"{gaussian_prob:.2e}"),
+        "chan_status": chan_status,
+        "tca_offset_sec": round(tca_sec, 1),
         "risk_score": round(risk_score, 4),
         "risk_level": risk_level,
         "recommendation": recommendation,
