@@ -13,20 +13,28 @@ class RK4Solver:
         """
         Perform a single RK4 step.
         """
-        def deriv(s):
-            a = self.force.acceleration(s)
-            return np.hstack((s.v, a))
+        position = state.r
+        velocity = state.v
 
-        y0 = np.hstack((state.r, state.v))
+        def acceleration_at(stage_position, stage_velocity):
+            stage = State.__new__(State)
+            stage.r = stage_position
+            stage.v = stage_velocity
+            return self.force.acceleration(stage)
 
-        k1 = deriv(state)
-        k2_state = State(y0[:3] + 0.5 * dt * k1[:3], y0[3:] + 0.5 * dt * k1[3:])
-        k2 = deriv(k2_state)
-        k3_state = State(y0[:3] + 0.5 * dt * k2[:3], y0[3:] + 0.5 * dt * k2[3:])
-        k3 = deriv(k3_state)
-        k4_state = State(y0[:3] + dt * k3[:3], y0[3:] + dt * k3[3:])
-        k4 = deriv(k4_state)
+        k1_position = velocity
+        k1_velocity = self.force.acceleration(state)
+        k2_position = velocity + 0.5 * dt * k1_velocity
+        k2_velocity = acceleration_at(position + 0.5 * dt * k1_position, k2_position)
+        k3_position = velocity + 0.5 * dt * k2_velocity
+        k3_velocity = acceleration_at(position + 0.5 * dt * k2_position, k3_position)
+        k4_position = velocity + dt * k3_velocity
+        k4_velocity = acceleration_at(position + dt * k3_position, k4_position)
 
-        y_next = y0 + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-        return State(y_next[:3], y_next[3:])
+        next_position = position + (dt / 6.0) * (
+            k1_position + 2 * k2_position + 2 * k3_position + k4_position
+        )
+        next_velocity = velocity + (dt / 6.0) * (
+            k1_velocity + 2 * k2_velocity + 2 * k3_velocity + k4_velocity
+        )
+        return State(next_position, next_velocity)
