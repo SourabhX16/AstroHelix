@@ -21,6 +21,9 @@ from api.state import (
     get_cdm_inbox,
     get_satellite,
 )
+from tools.risk import assess_conjunction_risk
+from tools.scenario import build_conjunction_debris
+from tools.screening import screen_conjunctions
 
 
 def _keplerian_to_eci(a, e, inc_rad, raan_rad, argp_rad, nu_rad):
@@ -59,7 +62,7 @@ DEMO_DEBRIS = [
         "nu_deg": 5.0,
         "miss_m": 350,
         "tca_offset_sec": 7200,
-        "risk": "critical",
+        "cross_deg": 42,
     },
     {
         "norad_id": 90002,
@@ -70,7 +73,7 @@ DEMO_DEBRIS = [
         "nu_deg": 12.0,
         "miss_m": 800,
         "tca_offset_sec": 14400,
-        "risk": "high",
+        "cross_deg": 60,
     },
     {
         "norad_id": 90003,
@@ -80,8 +83,8 @@ DEMO_DEBRIS = [
         "raan_deg": 31.2,
         "nu_deg": 20.0,
         "miss_m": 2500,
-        "tca_offset_sec": 28800,
-        "risk": "medium",
+        "tca_offset_sec": 18000,
+        "cross_deg": 78,
     },
     {
         "norad_id": 90004,
@@ -91,8 +94,8 @@ DEMO_DEBRIS = [
         "raan_deg": 28.5,
         "nu_deg": 355.0,
         "miss_m": 5000,
-        "tca_offset_sec": 43200,
-        "risk": "low",
+        "tca_offset_sec": 21600,
+        "cross_deg": 95,
     },
     {
         "norad_id": 90005,
@@ -103,7 +106,7 @@ DEMO_DEBRIS = [
         "nu_deg": 2.0,
         "miss_m": 150,
         "tca_offset_sec": 3600,
-        "risk": "critical",
+        "cross_deg": 112,
     },
     {
         "norad_id": 90006,
@@ -113,8 +116,8 @@ DEMO_DEBRIS = [
         "raan_deg": 32.0,
         "nu_deg": 45.0,
         "miss_m": 8000,
-        "tca_offset_sec": 57600,
-        "risk": "low",
+        "tca_offset_sec": 21600,
+        "cross_deg": 130,
     },
     {
         "norad_id": 90007,
@@ -125,7 +128,7 @@ DEMO_DEBRIS = [
         "nu_deg": 8.0,
         "miss_m": 600,
         "tca_offset_sec": 10800,
-        "risk": "high",
+        "cross_deg": 150,
     },
     {
         "norad_id": 90008,
@@ -136,7 +139,7 @@ DEMO_DEBRIS = [
         "nu_deg": 350.0,
         "miss_m": 1200,
         "tca_offset_sec": 21600,
-        "risk": "medium",
+        "cross_deg": 168,
     },
 ]
 
@@ -164,7 +167,14 @@ def load_demo_data() -> Dict[str, Any]:
         argp = math.radians(rng.uniform(0, 360))
         nu = math.radians(d["nu_deg"])
 
-        pos, vel = _keplerian_to_eci(a, e, inc, raan, argp, nu)
+        _keplerian_to_eci(a, e, inc, raan, argp, nu)
+        pos, vel = build_conjunction_debris(
+            satellite.position,
+            satellite.velocity,
+            d["tca_offset_sec"],
+            d["miss_m"],
+            d["cross_deg"],
+        )
 
         obj = OrbitalObject(
             norad_id=d["norad_id"],
@@ -178,11 +188,34 @@ def load_demo_data() -> Dict[str, Any]:
         catalog.add(obj)
         loaded_debris.append(d["norad_id"])
 
-        # Compute relative state for CDM
-        rel_pos = pos - satellite.position
-        rel_vel = vel - satellite.velocity
-        miss_dist = float(np.linalg.norm(rel_pos))
-        rel_speed = float(np.linalg.norm(rel_vel))
+        measured_events = screen_conjunctions(
+            primary_pos=satellite.position,
+            primary_vel=satellite.velocity,
+            debris_list=[obj.to_dict()],
+            lookahead_sec=d["tca_offset_sec"] + 10.0,
+            threshold_km=50000.0,
+            refine=True,
+        )
+        if not measured_events:
+            raise RuntimeError(f"Generated demo debris {d['norad_id']} did not produce a screened event")
+        measured = min(
+            measured_events,
+            key=lambda event: abs(event["tca_offset_sec"] - d["tca_offset_sec"]),
+        )
+        covariance_diagonal = [
+            rng.uniform(50, 500) ** 2,
+            rng.uniform(50, 500) ** 2,
+            rng.uniform(50, 500) ** 2,
+        ]
+        risk = assess_conjunction_risk(
+            primary_pos=satellite.position,
+            primary_vel=satellite.velocity,
+            secondary_pos=pos,
+            secondary_vel=vel,
+            covariance_diag=covariance_diagonal,
+            miss_distance_m=measured["miss_distance_m"],
+            tca_offset_sec=measured["tca_offset_sec"],
+        )
 
         # Generate CDM
         cdm = {
@@ -191,18 +224,14 @@ def load_demo_data() -> Dict[str, Any]:
             "primary_name": satellite.name,
             "secondary_id": d["norad_id"],
             "secondary_name": d["name"],
-            "tca_offset_sec": d["tca_offset_sec"],
-            "miss_distance_m": d["miss_m"],
-            "relative_velocity_ms": round(rel_speed, 1),
-            "risk_level": d["risk"],
-            "collision_probability": _risk_to_prob(d["risk"], d["miss_m"]),
+            "tca_offset_sec": measured["tca_offset_sec"],
+            "miss_distance_m": measured["miss_distance_m"],
+            "relative_velocity_ms": measured["relative_velocity_ms"],
+            "risk_level": risk["risk_level"],
+            "collision_probability": risk["collision_probability_chan"],
             "secondary_position": pos.tolist(),
             "secondary_velocity": vel.tolist(),
-            "covariance_diagonal_m2": [
-                rng.uniform(50, 500) ** 2,
-                rng.uniform(50, 500) ** 2,
-                rng.uniform(50, 500) ** 2,
-            ],
+            "covariance_diagonal_m2": covariance_diagonal,
             "processed": False,
             "timestamp": time.time(),
         }
@@ -226,16 +255,3 @@ def load_demo_data() -> Dict[str, Any]:
         "satellite": satellite.name,
         "satellite_norad_id": satellite.norad_id,
     }
-
-
-def _risk_to_prob(risk: str, miss_m: float) -> float:
-    """Convert risk level + miss distance to approximate collision probability."""
-    base = {
-        "critical": 1e-3,
-        "high": 1e-4,
-        "medium": 1e-5,
-        "low": 1e-6,
-    }.get(risk, 1e-7)
-    # Scale inversely with miss distance
-    scale = max(0.1, 1000.0 / max(miss_m, 1.0))
-    return min(1.0, base * scale)
