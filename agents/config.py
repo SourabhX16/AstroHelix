@@ -13,15 +13,15 @@ for the software simulation.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
 class LLMConfig:
     """Configuration for the LLM backend."""
     # Endpoint
-    base_url: str = "https://detour-ai.keanuc.net/v1"
+    base_url: str = "http://localhost:8001/v1"
     api_key: str = "not-needed"
     model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
 
@@ -31,18 +31,22 @@ class LLMConfig:
     top_p: float = 0.95
 
     # Agent parameters
-    max_iterations: int = 15          # max tool-call loops per agent
+    max_iterations: int = 10          # max tool-call loops per agent
     recursion_limit: int = 50         # LangGraph recursion limit
+    provider: Literal["openai_compat", "scripted"] = "openai_compat"
+    disable_thinking: bool = True
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
         """Build config from environment variables."""
         return cls(
-            base_url=os.getenv("NEMOTRON_BASE_URL", "https://detour-ai.keanuc.net/v1"),
+            base_url=os.getenv("NEMOTRON_BASE_URL", "http://localhost:8001/v1"),
             api_key=os.getenv("NEMOTRON_API_KEY", "not-needed"),
             model=os.getenv("NEMOTRON_MODEL", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"),
             temperature=float(os.getenv("NEMOTRON_TEMPERATURE", "0.3")),
             max_tokens=int(os.getenv("NEMOTRON_MAX_TOKENS", "2048")),
+            provider=os.getenv("LLM_PROVIDER", "openai_compat"),
+            disable_thinking=os.getenv("NEMOTRON_DISABLE_THINKING", "true").lower() in {"1", "true", "yes", "on"},
         )
 
     def to_llm_kwargs(self) -> dict:
@@ -52,20 +56,20 @@ class LLMConfig:
         context-window space remains after the input tokens.  This
         avoids 400 errors when accumulated agent context is large.
         """
-        return {
+        kwargs = {
             "base_url": self.base_url,
             "api_key": self.api_key,
             "model": self.model,
             "temperature": self.temperature,
-            "extra_body": {
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
         }
+        if self.disable_thinking:
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        return kwargs
 
 
 # Quick presets
 LOCAL_GX10 = LLMConfig(
-    base_url="https://detour-ai.keanuc.net/v1",
+    base_url="http://localhost:8001/v1",
     model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
 )
 

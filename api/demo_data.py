@@ -5,6 +5,7 @@ Generates realistic orbital objects and conjunction events for the demo.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -14,13 +15,16 @@ from typing import Any, Dict, List
 import numpy as np
 
 from engine.config.settings import GM, RE
-from engine.physics.entity import Entity
 from api.state import (
     OrbitalObject,
     get_catalog,
     get_cdm_inbox,
     get_satellite,
 )
+
+SCENARIO_VERSION = "1"
+_CACHE_PATH = os.path.join(os.path.dirname(__file__), "demo_cache.json")
+_MEMO: dict[str, list[dict[str, Any]]] = {}
 
 
 def _keplerian_to_eci(a, e, inc_rad, raan_rad, argp_rad, nu_rad):
@@ -141,7 +145,7 @@ DEMO_DEBRIS = [
 ]
 
 
-def load_demo_data() -> Dict[str, Any]:
+def load_demo_data(use_cache: bool = True) -> Dict[str, Any]:
     """
     Populate the catalog with demo debris objects and generate CDMs.
 
@@ -152,11 +156,30 @@ def load_demo_data() -> Dict[str, Any]:
     inbox = get_cdm_inbox()
     satellite = get_satellite()
 
-    rng = np.random.default_rng(42)
+    seed = 42
+    key_payload = {
+        "seed": seed,
+        "debris": DEMO_DEBRIS,
+        "satellite": {"norad_id": satellite.norad_id, "position": satellite.position.tolist(), "velocity": satellite.velocity.tolist()},
+        "scenario_version": SCENARIO_VERSION,
+    }
+    cache_key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()
+    states = _MEMO.get(cache_key) if use_cache else None
+    disk_cache: dict[str, Any] = {}
+    if states is None and use_cache:
+        try:
+            with open(_CACHE_PATH, encoding="utf-8") as cache_file:
+                disk_cache = json.load(cache_file)
+            if disk_cache.get("key") == cache_key:
+                states = disk_cache.get("states")
+        except (OSError, ValueError):
+            pass
+    rng = np.random.default_rng(seed)
     loaded_debris = []
     cdm_events = []
 
-    for d in DEMO_DEBRIS:
+    generated_states = []
+    for index, d in enumerate(DEMO_DEBRIS):
         a = RE + d["alt_km"] * 1000
         e = 0.0002 + rng.uniform(0, 0.003)
         inc = math.radians(d["inc_deg"])
@@ -165,6 +188,17 @@ def load_demo_data() -> Dict[str, Any]:
         nu = math.radians(d["nu_deg"])
 
         pos, vel = _keplerian_to_eci(a, e, inc, raan, argp, nu)
+        rcs_m2 = rng.uniform(0.01, 2.0)
+        mass_kg = rng.uniform(0.5, 50.0)
+        cov = [rng.uniform(50, 500) ** 2 for _ in range(3)]
+        if states is not None:
+            cached = states[index]
+            pos = np.asarray(cached["position"], dtype=float)
+            vel = np.asarray(cached["velocity"], dtype=float)
+            rcs_m2, mass_kg = cached["rcs_m2"], cached["mass_kg"]
+            cov = cached["covariance_diagonal_m2"]
+        else:
+            generated_states.append({"position": pos.tolist(), "velocity": vel.tolist(), "rcs_m2": rcs_m2, "mass_kg": mass_kg, "covariance_diagonal_m2": cov})
 
         obj = OrbitalObject(
             norad_id=d["norad_id"],
@@ -172,8 +206,8 @@ def load_demo_data() -> Dict[str, Any]:
             position=pos,
             velocity=vel,
             object_type="debris",
-            rcs_m2=rng.uniform(0.01, 2.0),
-            mass_kg=rng.uniform(0.5, 50.0),
+            rcs_m2=rcs_m2,
+            mass_kg=mass_kg,
         )
         catalog.add(obj)
         loaded_debris.append(d["norad_id"])
@@ -198,16 +232,23 @@ def load_demo_data() -> Dict[str, Any]:
             "collision_probability": _risk_to_prob(d["risk"], d["miss_m"]),
             "secondary_position": pos.tolist(),
             "secondary_velocity": vel.tolist(),
-            "covariance_diagonal_m2": [
-                rng.uniform(50, 500) ** 2,
-                rng.uniform(50, 500) ** 2,
-                rng.uniform(50, 500) ** 2,
-            ],
+            "covariance_diagonal_m2": cov,
             "processed": False,
             "timestamp": time.time(),
         }
         inbox.add(cdm)
         cdm_events.append(cdm)
+
+    if states is None:
+        states = generated_states
+        _MEMO[cache_key] = states
+        try:
+            with open(_CACHE_PATH, "w", encoding="utf-8") as cache_file:
+                json.dump({"key": cache_key, "states": states}, cache_file, separators=(",", ":"))
+        except OSError:
+            pass
+    else:
+        _MEMO[cache_key] = states
 
     # Also add the satellite itself to the catalog
     sat_obj = OrbitalObject(

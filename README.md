@@ -53,6 +53,10 @@ The current project is a software-only simulation designed to run on a developme
 | **Safety** | Validate constraints and check maneuver feasibility | `get_satellite_status`, `check_maneuver_constraints`, `check_maneuver_feasibility`, `propagate_satellite_orbit` |
 | **Ops Brief** | Apply the approved simulated burn and produce an operator summary | `assess_risk`, `execute_maneuver_on_satellite`, `get_satellite_status`, `propagate_satellite_orbit` |
 
+## Configuration
+
+Copy `.env.example` to `.env` and set `LLM_PROVIDER`, `NEMOTRON_BASE_URL`, `NEMOTRON_API_KEY`, and `NEMOTRON_MODEL` for an OpenAI-compatible tool-calling endpoint. `NEMOTRON_DISABLE_THINKING` defaults to `true` for vLLM-style local endpoints; set it to `false` for hosted APIs that reject that parameter. Set `LLM_PROVIDER=scripted` to run the deterministic offline pipeline without a model or API key. `AGENT_API_URL` and `LLM_API_URL` configure the frontend backend destinations.
+
 ## Quick Start
 
 ### 1. Backend
@@ -60,7 +64,7 @@ The current project is a software-only simulation designed to run on a developme
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn api.app:app --reload --port 8000
+uvicorn api.app:app --reload --port 8000 --env-file .env
 ```
 
 ### 2. Frontend

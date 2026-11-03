@@ -14,6 +14,8 @@ import logging
 import operator
 import queue as queue_module
 import time
+import socket
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Dict, List, Literal, Optional, Sequence, TypedDict
 
@@ -24,11 +26,12 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_openai import ChatOpenAI
+from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from agents.config import LLMConfig
+from agents.llm import make_llm
 from agents.prompts import (
     ANALYST_PROMPT,
     OPS_BRIEF_PROMPT,
@@ -108,13 +111,15 @@ class AgentState(TypedDict):
     ops_brief: Optional[str]
     # Event stream for real-time UI updates
     events: Annotated[List[Dict[str, Any]], operator.add]
+    pipeline_error: Optional[bool]
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Agent node factory
 # ─────────────────────────────────────────────────────────────────────────
 def _create_agent_node(
-    llm: ChatOpenAI,
+    llm: BaseChatModel,
+    config: LLMConfig,
     system_prompt: str,
     tools: list,
     agent_name: str,
@@ -143,9 +148,13 @@ def _create_agent_node(
         t0 = time.time()
         events: List[Dict[str, Any]] = []
 
+        if state.get("pipeline_error"):
+            return {"messages": [], "current_agent": next_agent or agent_name, "events": []}
+
         _emit({
             "type": "agent_start",
             "agent": agent_name,
+            "llm_provider": config.provider,
             "timestamp": time.time(),
         }, events)
 
@@ -172,7 +181,7 @@ def _create_agent_node(
                 break
 
         # Tool-calling loop
-        max_iterations = 10
+        max_iterations = config.max_iterations
         for iteration in range(max_iterations):
             _emit({
                 "type": "llm_call",
@@ -190,7 +199,30 @@ def _create_agent_node(
                 "timestamp": time.time(),
             }, events)
 
-            response = llm_with_tools.invoke(msgs)
+            try:
+                response = llm_with_tools.invoke(msgs)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+                text = str(exc)
+                host = urlparse(config.base_url).hostname or "configured endpoint"
+                lowered = text.lower()
+                if status in (401, 403):
+                    kind, message = "llm_auth", f"Authentication failed for LLM host {host}."
+                elif status in (400, 422):
+                    kind = "llm_bad_request"
+                    safe = text[:300]
+                    safe = __import__("re").sub(r"(?i)(api[_ -]?key|authorization|bearer)\s*[:=]?\s*[^\s,;]+", r"\1=[redacted]", safe)
+                    if config.api_key and config.api_key != "not-needed":
+                        safe = safe.replace(config.api_key, "[redacted]")
+                    safe = " ".join(safe.split())
+                    message = f"LLM host {host} rejected the request: {safe}"
+                elif isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror)) or any(term in lowered for term in ("connect", "timeout", "timed out", "name or service", "dns", "refused")):
+                    kind, message = "llm_unreachable", f"Could not reach LLM host {host}."
+                else:
+                    kind, message = "llm_other", f"LLM request failed at host {host}."
+                _emit({"type": "error", "error_kind": kind, "message": message, "timestamp": time.time()}, events)
+                return {"messages": [AIMessage(content=message, name=agent_name)], output_key: message,
+                        "current_agent": next_agent or agent_name, "events": events, "pipeline_error": True}
             msgs.append(response)
 
             # If no tool calls, we're done
@@ -210,6 +242,17 @@ def _create_agent_node(
                 _TOOL_CAP = 800
                 tool_results = tool_node.invoke({"messages": msgs})
                 tool_msgs = tool_results.get("messages", [])
+                # Preserve complete structured outputs for the deterministic offline
+                # model before truncating conversation context for hosted models.
+                if hasattr(llm_with_tools, "memory"):
+                    for raw_tm in tool_msgs:
+                        if isinstance(raw_tm, ToolMessage):
+                            try:
+                                parsed_tool_result = json.loads(raw_tm.content) if isinstance(raw_tm.content, str) else {}
+                                llm_with_tools.memory[raw_tm.name] = parsed_tool_result
+                                llm_with_tools.memory.setdefault("_tool_history", []).append((raw_tm.name, parsed_tool_result))
+                            except (TypeError, json.JSONDecodeError):
+                                pass
                 # Truncate tool outputs to stay within token budget
                 for tm in tool_msgs:
                     if isinstance(tm, ToolMessage) and isinstance(tm.content, str) and len(tm.content) > _TOOL_CAP:
@@ -300,28 +343,28 @@ def build_avoidance_graph(
     if config is None:
         config = LLMConfig.from_env()
 
-    llm = ChatOpenAI(**config.to_llm_kwargs())
+    llm = make_llm(config)
 
     # Create agent nodes
     scout_node = _create_agent_node(
-        llm, SCOUT_PROMPT, SCOUT_TOOLS, "scout", "scout_output", "analyst",
+        llm, config, SCOUT_PROMPT, SCOUT_TOOLS, "scout", "scout_output", "analyst",
         event_queue=event_queue,
     )
     analyst_node = _create_agent_node(
-        llm, ANALYST_PROMPT, ANALYST_TOOLS, "analyst", "analyst_output", "planner",
+        llm, config, ANALYST_PROMPT, ANALYST_TOOLS, "analyst", "analyst_output", "planner",
         event_queue=event_queue,
     )
     planner_node = _create_agent_node(
-        llm, PLANNER_PROMPT, PLANNER_TOOLS, "planner", "planner_output", "safety",
+        llm, config, PLANNER_PROMPT, PLANNER_TOOLS, "planner", "planner_output", "safety",
         event_queue=event_queue,
     )
     safety_node = _create_agent_node(
-        llm, SAFETY_PROMPT, SAFETY_TOOLS, "safety", "safety_output", "ops_brief",
+        llm, config, SAFETY_PROMPT, SAFETY_TOOLS, "safety", "safety_output", "ops_brief",
         event_queue=event_queue,
     )
     OPS_BRIEF_TOOLS = [assess_risk, execute_maneuver_on_satellite, get_satellite_status, propagate_satellite_orbit]
     ops_brief_node = _create_agent_node(
-        llm, OPS_BRIEF_PROMPT, OPS_BRIEF_TOOLS, "ops_brief", "ops_brief", None,
+        llm, config, OPS_BRIEF_PROMPT, OPS_BRIEF_TOOLS, "ops_brief", "ops_brief", None,
         event_queue=event_queue,
     )
 
@@ -359,7 +402,7 @@ def build_single_agent_graph(
     if config is None:
         config = LLMConfig.from_env()
 
-    llm = ChatOpenAI(**config.to_llm_kwargs())
+    llm = make_llm(config)
 
     SINGLE_AGENT_PROMPT = """You are Astro Helix, an AI collision avoidance copilot for satellites.
 You run on an NVIDIA edge AI device providing low-latency, local collision avoidance planning.
@@ -377,7 +420,7 @@ When asked to analyze threats or plan avoidance:
 Be concise and actionable. Satellite operators need clear decisions, not essays."""
 
     agent_node = _create_agent_node(
-        llm, SINGLE_AGENT_PROMPT, ALL_TOOLS, "astro_helix", "ops_brief", None,
+        llm, config, SINGLE_AGENT_PROMPT, ALL_TOOLS, "astro_helix", "ops_brief", None,
         event_queue=event_queue,
     )
 
@@ -422,6 +465,7 @@ def run_avoidance_pipeline(
         "safety_output": None,
         "ops_brief": None,
         "events": [],
+        "pipeline_error": False,
     }
 
     result = graph.invoke(initial_state, {"recursion_limit": 50})
@@ -464,6 +508,7 @@ async def stream_avoidance_pipeline(
         "safety_output": None,
         "ops_brief": None,
         "events": [],
+        "pipeline_error": False,
     }
 
     done = asyncio.Event()
@@ -472,8 +517,9 @@ async def stream_avoidance_pipeline(
         try:
             async for _chunk in graph.astream(initial_state, {"recursion_limit": 50}):
                 pass  # events are pushed to the queue from inside nodes
-        except Exception as e:
-            eq.put({"type": "error", "message": str(e), "timestamp": time.time()})
+        except Exception:
+            host = urlparse((config or LLMConfig.from_env()).base_url).hostname or "configured endpoint"
+            eq.put({"type": "error", "error_kind": "llm_other", "message": f"LLM pipeline failed at host {host}.", "timestamp": time.time()})
         finally:
             done.set()
 

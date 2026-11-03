@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import time
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -68,19 +69,43 @@ def health():
 
 
 @app.get("/status")
-def status():
+def status(probe: int = Query(default=0)):
     sat = get_satellite()
     config = _get_config()
+    llm = {
+        "llm_provider": config.provider,
+        "llm_host": urlparse(config.base_url).hostname,
+        "model": config.model,
+        "configured": bool(config.provider == "scripted" or (config.base_url and config.model and config.api_key and config.api_key != "not-needed")),
+    }
+    if probe == 1:
+        if config.provider == "scripted":
+            llm["llm_reachable"] = True
+        else:
+            from langchain_openai import ChatOpenAI
+            try:
+                kwargs = config.to_llm_kwargs()
+                kwargs.update(timeout=8, max_tokens=1)
+                ChatOpenAI(**kwargs).invoke("Reply with OK")
+                llm["llm_reachable"] = True
+            except Exception as exc:
+                llm["llm_reachable"] = False
+                status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code in (401, 403):
+                    llm["error_kind"] = "llm_auth"
+                elif status_code in (400, 422):
+                    llm["error_kind"] = "llm_bad_request"
+                elif any(term in str(exc).lower() for term in ("connect", "timeout", "timed out", "refused", "dns")):
+                    llm["error_kind"] = "llm_unreachable"
+                else:
+                    llm["error_kind"] = "llm_other"
     return {
         "satellite": {
             "norad_id": sat.norad_id,
             "name": sat.name,
-            "fuel_pct": round(sat.fuel_kg / sat.config.fuel_capacity * 100, 1),
+            "fuel_pct": round(sat.fuel_kg / sat.config.fuel_capacity_kg * 100, 1),
         },
-        "llm": {
-            "model": config.model,
-            "base_url": config.base_url,
-        },
+        "llm": llm,
     }
 
 
@@ -125,8 +150,9 @@ async def agent_stream(
             async for event in stream_avoidance_pipeline(prompt, config=config, mode=mode):
                 data = json.dumps(event, default=str)
                 yield f"data: {data}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        except Exception:
+            host = urlparse(config.base_url).hostname or "configured endpoint"
+            yield f"data: {json.dumps({'type': 'error', 'error_kind': 'llm_other', 'message': f'LLM pipeline failed at host {host}.'})}\n\n"
         finally:
             yield f"data: {json.dumps({'type': 'done', 'timestamp': time.time()})}\n\n"
 
