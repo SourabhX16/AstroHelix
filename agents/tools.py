@@ -92,6 +92,7 @@ def scan_demo_conjunctions() -> str:
 def assess_risk(
     secondary_id: int,
     miss_distance_m: Optional[float] = None,
+    tca_offset_sec: Optional[float] = None,
 ) -> str:
     """
     Compute detailed collision probability and risk for a conjunction event.
@@ -99,6 +100,7 @@ def assess_risk(
     Args:
         secondary_id: NORAD ID of the debris object
         miss_distance_m: known miss distance (optional, computed if not given)
+        tca_offset_sec: time to closest approach (optional, read from CDM or screened)
     """
     sat = get_satellite()
     catalog = get_catalog()
@@ -106,12 +108,34 @@ def assess_risk(
     if obj is None:
         return json.dumps({"error": f"Object {secondary_id} not found in catalog"})
 
+    if tca_offset_sec is None:
+        cdm = next(
+            (message for message in reversed(get_cdm_inbox().get_all())
+             if message.get("secondary_id") == secondary_id),
+            None,
+        )
+        if cdm is not None:
+            tca_offset_sec = float(cdm["tca_offset_sec"])
+        else:
+            events = screen_conjunctions(
+                primary_pos=sat.position,
+                primary_vel=sat.velocity,
+                debris_list=[obj.to_dict()],
+                lookahead_sec=86400.0,
+                threshold_km=50000.0,
+            )
+            if events:
+                tca_offset_sec = float(events[0]["tca_offset_sec"])
+            else:
+                tca_offset_sec = 0.0
+
     result = assess_conjunction_risk(
         primary_pos=sat.position,
         primary_vel=sat.velocity,
         secondary_pos=obj.position,
         secondary_vel=obj.velocity,
         miss_distance_m=miss_distance_m,
+        tca_offset_sec=tca_offset_sec,
     )
     result["secondary_id"] = secondary_id
     result["secondary_name"] = obj.name

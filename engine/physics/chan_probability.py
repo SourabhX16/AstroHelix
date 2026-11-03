@@ -129,6 +129,8 @@ instead of nested Python loops.
 import numpy as np
 from typing import Tuple
 
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 
 def _plane_basis_from_vector(u: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -263,8 +265,8 @@ def chan_collision_probability(
     integrand = density * rmat
 
     # Integrate first along radius (axis=1), then along theta (axis=0)
-    int_r = np.trapz(integrand, rs, axis=1)          # shape (n_theta,)
-    integral = np.trapz(int_r, thetas)               # scalar
+    int_r = _trapz(integrand, rs, axis=1)          # shape (n_theta,)
+    integral = _trapz(int_r, thetas)               # scalar
 
     # Normalization constant of 2D Gaussian
     norm = 1.0 / (2.0 * np.pi * np.sqrt(detC2))
