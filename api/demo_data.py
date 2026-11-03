@@ -6,8 +6,10 @@ Generates realistic orbital objects and conjunction events for the demo.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+from pathlib import Path
 import time
 from typing import Any, Dict, List
 
@@ -143,17 +145,76 @@ DEMO_DEBRIS = [
     },
 ]
 
+SCENARIO_VERSION = 2
+_CACHE_PATH = Path(__file__).with_name("demo_cache.json")
+_MEMO: Dict[str, Dict[str, Any]] = {}
 
-def load_demo_data() -> Dict[str, Any]:
+
+def _cache_key(satellite) -> str:
+    root = Path(__file__).resolve().parent.parent
+    files = [root / name for name in (
+        "tools/scenario.py", "tools/screening.py", "tools/risk.py", "api/demo_data.py",
+    )]
+    files.extend(sorted((root / "engine/physics").glob("*.py")))
+    source_hashes = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+    payload = {
+        "version": SCENARIO_VERSION,
+        "debris": DEMO_DEBRIS,
+        "satellite": {"position": satellite.position.tolist(), "velocity": satellite.velocity.tolist()},
+        "sources": source_hashes,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def invalidate_demo_scan_cache() -> None:
+    """Drop scan results when demo state is explicitly reloaded."""
+    global _SCAN_CACHE
+    _SCAN_CACHE = None
+
+
+_SCAN_CACHE = None
+_LOADED_KEY = None
+
+
+def load_demo_data(use_cache: bool = True) -> Dict[str, Any]:
     """
     Populate the catalog with demo debris objects and generate CDMs.
 
     Returns:
         Summary of loaded data
     """
+    global _LOADED_KEY
     catalog = get_catalog()
     inbox = get_cdm_inbox()
     satellite = get_satellite()
+    invalidate_demo_scan_cache()
+    key = _cache_key(satellite)
+    _LOADED_KEY = key
+    cache = _MEMO.get(key)
+    if cache is None and use_cache:
+        try:
+            disk = json.loads(_CACHE_PATH.read_text())
+            candidate = disk.get("debris") if isinstance(disk, dict) else None
+            expected_ids = {str(item["norad_id"]) for item in DEMO_DEBRIS}
+            valid = (
+                isinstance(candidate, dict)
+                and set(candidate) == expected_ids
+                and all(
+                    isinstance(value, dict)
+                    and all(field in value for field in ("position", "velocity", "event", "risk"))
+                    and isinstance(value["event"], dict)
+                    and isinstance(value["risk"], dict)
+                    for value in candidate.values()
+                )
+            )
+            if isinstance(disk, dict) and disk.get("key") == key and valid:
+                cache = candidate
+                _MEMO[key] = cache
+        except (OSError, ValueError, TypeError, AttributeError):
+            cache = None
+    if not use_cache:
+        cache = None
+    computed: Dict[str, Any] = {}
 
     rng = np.random.default_rng(42)
     loaded_debris = []
@@ -168,13 +229,15 @@ def load_demo_data() -> Dict[str, Any]:
         nu = math.radians(d["nu_deg"])
 
         _keplerian_to_eci(a, e, inc, raan, argp, nu)
-        pos, vel = build_conjunction_debris(
-            satellite.position,
-            satellite.velocity,
-            d["tca_offset_sec"],
-            d["miss_m"],
-            d["cross_deg"],
-        )
+        entry = cache.get(str(d["norad_id"])) if cache else None
+        if entry:
+            pos, vel = np.asarray(entry["position"]), np.asarray(entry["velocity"])
+            measured = entry["event"]
+            risk = entry["risk"]
+        else:
+            pos, vel = build_conjunction_debris(
+                satellite.position, satellite.velocity, d["tca_offset_sec"], d["miss_m"], d["cross_deg"]
+            )
 
         obj = OrbitalObject(
             norad_id=d["norad_id"],
@@ -188,34 +251,33 @@ def load_demo_data() -> Dict[str, Any]:
         catalog.add(obj)
         loaded_debris.append(d["norad_id"])
 
-        measured_events = screen_conjunctions(
-            primary_pos=satellite.position,
-            primary_vel=satellite.velocity,
-            debris_list=[obj.to_dict()],
-            lookahead_sec=d["tca_offset_sec"] + 10.0,
-            threshold_km=50000.0,
-            refine=True,
-        )
-        if not measured_events:
-            raise RuntimeError(f"Generated demo debris {d['norad_id']} did not produce a screened event")
-        measured = min(
-            measured_events,
-            key=lambda event: abs(event["tca_offset_sec"] - d["tca_offset_sec"]),
-        )
+        if not entry:
+            measured_events = screen_conjunctions(
+                primary_pos=satellite.position, primary_vel=satellite.velocity,
+                debris_list=[obj.to_dict()], lookahead_sec=d["tca_offset_sec"] + 10.0,
+                threshold_km=50000.0, refine=True,
+            )
+            if not measured_events:
+                raise RuntimeError(f"Generated demo debris {d['norad_id']} did not produce a screened event")
+            measured = min(measured_events, key=lambda event: abs(event["tca_offset_sec"] - d["tca_offset_sec"]))
         covariance_diagonal = [
             rng.uniform(50, 500) ** 2,
             rng.uniform(50, 500) ** 2,
             rng.uniform(50, 500) ** 2,
         ]
-        risk = assess_conjunction_risk(
-            primary_pos=satellite.position,
-            primary_vel=satellite.velocity,
-            secondary_pos=pos,
-            secondary_vel=vel,
-            covariance_diag=covariance_diagonal,
-            miss_distance_m=measured["miss_distance_m"],
-            tca_offset_sec=measured["tca_offset_sec"],
-        )
+        if not entry:
+            risk = assess_conjunction_risk(
+                primary_pos=satellite.position,
+                primary_vel=satellite.velocity,
+                secondary_pos=pos,
+                secondary_vel=vel,
+                covariance_diag=covariance_diagonal,
+                miss_distance_m=measured["miss_distance_m"],
+                tca_offset_sec=measured["tca_offset_sec"],
+            )
+            computed[str(d["norad_id"])] = {
+                "position": pos.tolist(), "velocity": vel.tolist(), "event": measured, "risk": risk,
+            }
 
         # Generate CDM
         cdm = {
@@ -247,6 +309,13 @@ def load_demo_data() -> Dict[str, Any]:
         object_type="satellite",
     )
     catalog.add(sat_obj)
+
+    if computed:
+        _MEMO[key] = computed
+        try:
+            _CACHE_PATH.write_text(json.dumps({"key": key, "debris": computed}, separators=(",", ":")))
+        except OSError:
+            pass
 
     return {
         "debris_loaded": len(loaded_debris),

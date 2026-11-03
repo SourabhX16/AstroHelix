@@ -16,6 +16,10 @@ from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from typing import Optional
 
+if os.getenv("ASTRO_HELIX_SKIP_DOTENV") != "1":
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -76,6 +80,7 @@ def status(probe: int = Query(default=0)):
         "llm_provider": config.provider,
         "llm_host": urlparse(config.base_url).hostname,
         "model": config.model,
+        "base_url_source": "env" if "NEMOTRON_BASE_URL" in os.environ else "default",
         "configured": bool(config.provider == "scripted" or (config.base_url and config.model and config.api_key and config.api_key != "not-needed")),
     }
     if probe == 1:

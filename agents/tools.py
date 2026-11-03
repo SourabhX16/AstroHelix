@@ -22,6 +22,22 @@ from tools.risk import assess_conjunction_risk
 from tools.screening import screen_conjunctions
 
 
+def _compact_events(events: list[dict]) -> tuple[list[dict], int]:
+    closest = {}
+    for event in events:
+        secondary_id = event.get("secondary_id")
+        if secondary_id is None:
+            continue
+        if (
+            secondary_id not in closest
+            or event.get("miss_distance_m", float("inf"))
+            < closest[secondary_id].get("miss_distance_m", float("inf"))
+        ):
+            closest[secondary_id] = event
+    ordered = sorted(closest.values(), key=lambda event: event.get("miss_distance_m", float("inf")))
+    return ordered[:10], len(events)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # CDM / Catalog tools (Agent 0 — Scout)
 # ─────────────────────────────────────────────────────────────────────────
@@ -57,16 +73,33 @@ def scan_conjunctions(lookahead_hours: float = 24.0, threshold_km: float = 50.0)
         lookahead_sec=lookahead_hours * 3600,
         threshold_km=threshold_km,
     )
-    return json.dumps({"total_screened": len(debris_list), "events_found": len(events), "events": events}, indent=2)
+    shown, total = _compact_events(events)
+    return json.dumps({
+        "total_screened": len(debris_list),
+        "events_found": len(events),
+        "total_encounters_found": total,
+        "events_shown": len(shown),
+        "events": shown,
+    }, indent=2)
 
 
 @tool
 def scan_demo_conjunctions() -> str:
     """Load demo debris data and scan for conjunctions. Use this for testing/demo."""
-    summary = load_demo_data()
     sat = get_satellite()
     catalog = get_catalog()
     debris_list = [obj.to_dict() for obj in catalog.list_debris()]
+    from api import demo_data
+    demo_ids = {int(item["norad_id"]) for item in demo_data.DEMO_DEBRIS}
+    if (
+        {int(item["norad_id"]) for item in debris_list} != demo_ids
+        or demo_data._LOADED_KEY != demo_data._cache_key(sat)
+    ):
+        load_demo_data()
+        debris_list = [obj.to_dict() for obj in get_catalog().list_debris()]
+    signature = json.dumps({"sat": [sat.position.tolist(), sat.velocity.tolist()], "debris": debris_list}, sort_keys=True)
+    if demo_data._SCAN_CACHE and demo_data._SCAN_CACHE[0] == signature:
+        return demo_data._SCAN_CACHE[1]
 
     events = screen_conjunctions(
         primary_pos=sat.position,
@@ -75,13 +108,18 @@ def scan_demo_conjunctions() -> str:
         lookahead_sec=86400,
         threshold_km=50.0,
     )
-    return json.dumps({
+    shown, total = _compact_events(events)
+    result = json.dumps({
         "demo_loaded": True,
         "debris_count": len(debris_list),
         "events_found": len(events),
-        "events": events,
+        "total_encounters_found": total,
+        "events_shown": len(shown),
+        "events": shown,
         "satellite": {"norad_id": sat.norad_id, "name": sat.name},
     }, indent=2)
+    demo_data._SCAN_CACHE = (signature, result)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────

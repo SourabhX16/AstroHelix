@@ -1,6 +1,7 @@
 numpy>=1.24
 fastapi>=0.109
 uvicorn[standard]>=0.27
+python-dotenv>=1.0
 
 # ── LangChain / LangGraph (Nemotron agent system) ──
 langchain>=0.3

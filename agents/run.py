@@ -21,6 +21,11 @@ import argparse
 import json
 import sys
 import time
+import os
+
+if os.getenv("ASTRO_HELIX_SKIP_DOTENV") != "1":
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
 
 from agents.config import LLMConfig
 from agents.graph import run_avoidance_pipeline

@@ -53,47 +53,6 @@ from agents.tools import (
 
 logger = logging.getLogger("astro_helix.agents.graph")
 
-# Synthetic reasoning strings displayed in the terminal while the LLM processes.
-# Cycles per-agent so each shows domain-appropriate "thinking" lines.
-SYNTHETIC_THOUGHTS: Dict[str, List[str]] = {
-    "scout": [
-        "Scanning TLE catalog for close-approach objects...",
-        "Cross-referencing conjunction database with active satellites...",
-        "Filtering debris objects by orbital regime...",
-        "Checking Space-Track CDM alerts...",
-    ],
-    "analyst": [
-        "Computing miss-distance probability density...",
-        "Propagating covariance matrices through encounter window...",
-        "Evaluating Pc via Monte-Carlo sampling...",
-        "Assessing relative velocity and geometry at TCA...",
-    ],
-    "planner": [
-        "Generating candidate delta-V maneuver profiles...",
-        "Evaluating fuel-optimal avoidance trajectories...",
-        "Checking station-keeping budget constraints...",
-        "Ranking maneuver options by risk reduction...",
-    ],
-    "safety": [
-        "Verifying maneuver does not create secondary conjunctions...",
-        "Checking debris-generation risk of proposed trajectory...",
-        "Validating compliance with space-safety guidelines...",
-        "Assessing re-entry corridor clearance...",
-    ],
-    "ops_brief": [
-        "Compiling operator decision summary...",
-        "Formatting timeline and action items...",
-        "Synthesizing risk assessment into brief...",
-    ],
-    "astro_helix": [
-        "Analyzing orbital conjunction geometry...",
-        "Running physics propagation for threat assessment...",
-        "Evaluating avoidance maneuver candidates...",
-        "Compiling operator-ready brief...",
-    ],
-}
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # State
 # ─────────────────────────────────────────────────────────────────────────
@@ -190,12 +149,10 @@ def _create_agent_node(
                 "timestamp": time.time(),
             }, events)
 
-            # Synthetic reasoning — gives the operator something to read while the LLM works
-            thoughts = SYNTHETIC_THOUGHTS.get(agent_name, ["Processing..."])
             _emit({
                 "type": "thinking",
                 "agent": agent_name,
-                "text": thoughts[iteration % len(thoughts)],
+                "text": "waiting for model response...",
                 "timestamp": time.time(),
             }, events)
 

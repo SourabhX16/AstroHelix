@@ -62,6 +62,10 @@ class ScriptedChatModel(BaseChatModel):
             cdms = cdms.get("cdms", cdms.get("messages", []))
         if not events and isinstance(cdms, list):
             events = cdms
+        events = sorted(
+            events,
+            key=lambda event: event.get("miss_distance_m", float("inf")),
+        )
         for message in messages:
             if isinstance(message, HumanMessage) and "[Safety review]" in str(message.content):
                 self.memory["safety_final"] = str(message.content).split("[Safety review]", 1)[-1].strip()

@@ -9,7 +9,8 @@ from agents.graph import run_avoidance_pipeline, stream_avoidance_pipeline
 from api.app import app
 from api.demo_data import DEMO_DEBRIS, load_demo_data
 import api.demo_data as demo_data_module
-from api.state import get_catalog, get_satellite, reset_state
+from api.state import get_catalog, get_cdm_inbox, get_satellite, reset_state
+from agents.tools import scan_demo_conjunctions
 
 
 PROMPT = "Analyze threats for ISS using the demo dataset"
@@ -28,6 +29,9 @@ def test_scripted_multi_pipeline_executes_in_order():
     assert any(e["type"] == "maneuver_executed" for e in result["events"])
     assert (get_satellite().velocity != before).any()
     assert result["ops_brief"]
+    risk_calls = [e for e in result["events"] if e["type"] == "tool_result" and e["tool"] == "assess_risk"]
+    assert risk_calls
+    assert '3600.0' in risk_calls[0]["summary"]
 
 
 def test_scripted_stream_order_and_completion():
@@ -76,8 +80,10 @@ def test_scripted_single_agent_smoke():
 
 
 def test_cached_demo_states_match_fresh_generation_and_load_quickly():
+    reset_state()
     load_demo_data(use_cache=False)
     fresh = {obj.norad_id: (obj.position.copy(), obj.velocity.copy()) for obj in get_catalog().list_debris()}
+    fresh_cdms = [{key: value for key, value in cdm.items() if key != "timestamp"} for cdm in get_cdm_inbox().get_all()]
     reset_state()
     demo_data_module._MEMO.clear()
     started = time.monotonic()
@@ -88,4 +94,37 @@ def test_cached_demo_states_match_fresh_generation_and_load_quickly():
     for norad_id in fresh:
         for actual, expected in zip(cached[norad_id], fresh[norad_id]):
             assert abs(actual - expected).max() <= 1e-6 * max(1.0, abs(expected).max())
-    assert elapsed < 5
+    warm_cdms = [{key: value for key, value in cdm.items() if key != "timestamp"} for cdm in get_cdm_inbox().get_all()]
+    assert warm_cdms == fresh_cdms
+    assert elapsed < 2
+
+
+def test_demo_cache_key_change_forces_per_debris_regeneration(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(demo_data_module, "_CACHE_PATH", tmp_path / "demo_cache.json")
+    monkeypatch.setattr(demo_data_module, "_MEMO", {})
+    monkeypatch.setattr(demo_data_module, "build_conjunction_debris", lambda *args: (calls.append("build") or get_satellite().position.copy(), get_satellite().velocity.copy()))
+    monkeypatch.setattr(demo_data_module, "screen_conjunctions", lambda **kwargs: [{"tca_offset_sec": 3600.0, "miss_distance_m": 150.0, "relative_velocity_ms": 1000.0}])
+    monkeypatch.setattr(demo_data_module, "assess_conjunction_risk", lambda **kwargs: {"risk_level": "low", "collision_probability_chan": 0.0})
+    demo_data_module.load_demo_data()
+    first_count = len(calls)
+    monkeypatch.setattr(demo_data_module, "SCENARIO_VERSION", demo_data_module.SCENARIO_VERSION + 1)
+    reset_state()
+    demo_data_module.load_demo_data()
+    assert first_count == len(DEMO_DEBRIS)
+    assert len(calls) == 2 * len(DEMO_DEBRIS)
+
+
+def test_demo_scan_is_cached_until_satellite_state_changes(monkeypatch):
+    from agents import tools as agent_tools
+
+    calls = []
+    monkeypatch.setattr(agent_tools, "screen_conjunctions", lambda **kwargs: (calls.append(1) or [{"secondary_id": 90005, "miss_distance_m": 150.0, "tca_offset_sec": 3600.0}]))
+    monkeypatch.setattr(agent_tools, "load_demo_data", lambda: None)
+    first = scan_demo_conjunctions.func()
+    second = scan_demo_conjunctions.func()
+    assert first == second
+    assert len(calls) == 1
+    get_satellite().position[0] += 0.01
+    scan_demo_conjunctions.func()
+    assert len(calls) == 2

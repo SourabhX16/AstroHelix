@@ -1,7 +1,7 @@
 import numpy as np
 
 from api.demo_data import DEMO_DEBRIS, load_demo_data
-from api.state import get_catalog, get_satellite, reset_state
+from api.state import get_catalog, get_cdm_inbox, get_satellite, reset_state
 from engine.physics.chan_probability import chan_collision_probability
 from tools.risk import assess_conjunction_risk
 from tools.scenario import build_conjunction_debris
@@ -100,3 +100,6 @@ def test_demo_cdms_are_measured_conjunctions():
         assert abs(measured["miss_distance_m"] - design["miss_m"]) <= max(
             design["miss_m"] * 0.05, 10.0
         )
+        cdm = next(item for item in get_cdm_inbox().get_all() if item["secondary_id"] == design["norad_id"])
+        assert abs(cdm["tca_offset_sec"] - design["tca_offset_sec"]) <= 1.0
+        assert abs(cdm["miss_distance_m"] - design["miss_m"]) <= max(design["miss_m"] * 0.05, 10.0)
