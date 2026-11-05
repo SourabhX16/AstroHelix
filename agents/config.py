@@ -31,7 +31,7 @@ class LLMConfig:
     top_p: float = 0.95
 
     # Agent parameters
-    max_iterations: int = 10          # max tool-call loops per agent
+    max_iterations: int = 8           # tool-call loops; one unbound final report call may follow
     recursion_limit: int = 50         # LangGraph recursion limit
     provider: Literal["openai_compat", "scripted"] = "openai_compat"
     disable_thinking: bool = True

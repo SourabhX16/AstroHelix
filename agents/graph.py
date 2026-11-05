@@ -13,6 +13,7 @@ import json
 import logging
 import operator
 import queue as queue_module
+import re
 import time
 import socket
 from urllib.parse import urlparse
@@ -28,7 +29,6 @@ from langchain_core.messages import (
 )
 from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, StateGraph
-from langgraph.prebuilt import ToolNode
 
 from agents.config import LLMConfig
 from agents.llm import make_llm
@@ -52,6 +52,17 @@ from agents.tools import (
 )
 
 logger = logging.getLogger("astro_helix.agents.graph")
+
+
+def _vector_after(label: str, text: str) -> Optional[list[float]]:
+    match = re.search(label + r".*?(\[[^\]]+\])", text or "", flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(1))
+        return [float(component) for component in value] if isinstance(value, list) and len(value) == 3 else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────
 # State
@@ -94,7 +105,7 @@ def _create_agent_node(
     4. Emits events for real-time streaming via event_queue
     """
     llm_with_tools = llm.bind_tools(tools) if tools else llm
-    tool_node = ToolNode(tools) if tools else None
+    tools_by_name = {getattr(tool, "name", ""): tool for tool in tools}
 
     def _emit(event: dict, events: list):
         """Push event to both the local list and the real-time queue."""
@@ -141,6 +152,8 @@ def _create_agent_node(
 
         # Tool-calling loop
         max_iterations = config.max_iterations
+        executed_calls: dict[tuple[str, str], str] = {}
+        exhausted_with_tools = False
         for iteration in range(max_iterations):
             _emit({
                 "type": "llm_call",
@@ -186,7 +199,7 @@ def _create_agent_node(
             if not response.tool_calls:
                 break
 
-            # Execute tool calls
+            # Execute tool calls, replaying prior identical calls within this agent run.
             _emit({
                 "type": "tool_calls",
                 "agent": agent_name,
@@ -194,11 +207,39 @@ def _create_agent_node(
                 "timestamp": time.time(),
             }, events)
 
-            if tool_node:
+            if tools:
                 # Create a mini-state for the tool node
                 _TOOL_CAP = 800
-                tool_results = tool_node.invoke({"messages": msgs})
-                tool_msgs = tool_results.get("messages", [])
+                tool_msgs = []
+                for tc in response.tool_calls:
+                    tool_name = tc.get("name", "")
+                    args = tc.get("args", {})
+                    fingerprint = (tool_name, json.dumps(args, sort_keys=True, separators=(",", ":"), default=str))
+                    if fingerprint in executed_calls:
+                        result_text = "(duplicate call, result unchanged) " + executed_calls[fingerprint]
+                    else:
+                        try:
+                            gate_error = None
+                            if agent_name == "safety" and tool_name in {"check_maneuver_feasibility", "check_maneuver_constraints"}:
+                                expected = _vector_after(r"RECOMMENDED MANEUVER:", state.get("planner_output") or "")
+                                supplied = [float(value) for value in args.get("delta_v", [])]
+                                if expected is None or supplied != expected:
+                                    gate_error = {"error": "Delta-v does not exactly match Planner's RECOMMENDED MANEUVER", "expected_delta_v": expected, "supplied_delta_v": supplied, "feasible": False, "overall_pass": False}
+                            if agent_name == "ops_brief" and tool_name == "execute_maneuver_on_satellite":
+                                safety_text = state.get("safety_output") or ""
+                                expected = _vector_after(r"VERDICT:\s*APPROVED.*?(?:delta_v_vector|delta-v vector|vector)", safety_text)
+                                supplied = [float(value) for value in args.get("delta_v", [])]
+                                if not re.search(r"VERDICT:\s*APPROVED", safety_text, flags=re.IGNORECASE) or expected is None or supplied != expected:
+                                    gate_error = {"error": "Execution requires the exact delta_v_vector from an APPROVED Safety verdict", "expected_delta_v": expected, "supplied_delta_v": supplied, "executed": False, "fuel_used_kg": 0.0}
+                            if gate_error:
+                                result_text = json.dumps(gate_error)
+                            else:
+                                result = tools_by_name[tool_name].invoke(args)
+                                result_text = result if isinstance(result, str) else json.dumps(result, default=str)
+                        except Exception as exc:
+                            result_text = json.dumps({"error": str(exc)})
+                        executed_calls[fingerprint] = result_text
+                    tool_msgs.append(ToolMessage(content=result_text, name=tool_name, tool_call_id=tc.get("id", "")))
                 # Preserve complete structured outputs for the deterministic offline
                 # model before truncating conversation context for hosted models.
                 if hasattr(llm_with_tools, "memory"):
@@ -215,6 +256,7 @@ def _create_agent_node(
                     if isinstance(tm, ToolMessage) and isinstance(tm.content, str) and len(tm.content) > _TOOL_CAP:
                         tm.content = tm.content[:_TOOL_CAP] + "...[truncated]"
                 msgs.extend(tool_msgs)
+                exhausted_with_tools = iteration == max_iterations - 1 and bool(response.tool_calls)
 
                 for tm in tool_msgs:
                     if isinstance(tm, ToolMessage):
@@ -224,7 +266,7 @@ def _create_agent_node(
                             "tool": tm.name,
                             "timestamp": time.time(),
                             # Truncate large outputs for event stream
-                            "summary": tm.content[:200] if isinstance(tm.content, str) else str(tm.content)[:200],
+                            "summary": tm.content[:1200] if tm.name == "execute_maneuver_on_satellite" and isinstance(tm.content, str) else (tm.content[:200] if isinstance(tm.content, str) else str(tm.content)[:200]),
                         }, events)
 
                         # When a maneuver is executed, emit post-maneuver state
@@ -241,19 +283,36 @@ def _create_agent_node(
                                         _dv = _res["delta_v"]
                                 except Exception:
                                     pass
-                                _emit({
+                                if _res.get("executed") is True:
+                                    _emit({
                                     "type": "maneuver_executed",
                                     "agent": agent_name,
                                     "timestamp": time.time(),
                                     "position": _sat.position.tolist(),
                                     "velocity": _sat.velocity.tolist(),
                                     "delta_v": _dv,
-                                }, events)
+                                    }, events)
                             except Exception:
                                 pass
 
+        if exhausted_with_tools:
+            _emit({"type": "iteration_limit", "agent": agent_name, "timestamp": time.time()}, events)
+            _emit({"type": "llm_call", "agent": agent_name, "iteration": max_iterations + 1, "final": True, "timestamp": time.time()}, events)
+            try:
+                final_response = llm.invoke(msgs + [SystemMessage(content="Iteration limit reached. Write your final report now, using only the tool results above. No more tool calls.")])
+                msgs.append(final_response)
+            except Exception as exc:
+                logger.warning("[%s] final report call after iteration cap failed: %s", agent_name, exc)
+
         # Extract final response
-        final_content = msgs[-1].content if msgs else ""
+        final_content = msgs[-1].content if msgs and isinstance(msgs[-1], AIMessage) else ""
+        if isinstance(final_content, (dict, list)):
+            final_content = json.dumps(final_content, default=str)
+        if agent_name == "safety":
+            mismatch = any(isinstance(message, ToolMessage) and "does not exactly match Planner" in str(message.content) for message in msgs)
+            if mismatch:
+                expected = _vector_after(r"RECOMMENDED MANEUVER:", state.get("planner_output") or "")
+                final_content = f"VERDICT: REJECTED; delta_v_vector: {json.dumps(expected)}; Planner recommendation did not match the maneuver reviewed by Safety."
 
         elapsed = time.time() - t0
         _emit({
@@ -362,7 +421,7 @@ def build_single_agent_graph(
     llm = make_llm(config)
 
     SINGLE_AGENT_PROMPT = """You are Astro Helix, an AI collision avoidance copilot for satellites.
-You run on an NVIDIA edge AI device providing low-latency, local collision avoidance planning.
+You are part of a software simulation of on-board collision-avoidance autonomy.
 
 You have access to physics tools that compute real orbital mechanics. NEVER guess numbers.
 Always call tools to get actual data.

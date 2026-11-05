@@ -7,9 +7,7 @@ Agent 2: Resource Guardian
 Agent 3: Execution & Feedback
 """
 
-SYSTEM_BASE = """You are part of the Astro Helix autonomous satellite collision avoidance system.
-You run ON-BOARD a satellite on an NVIDIA edge AI device (ASUS Ascent GX10 with Grace Blackwell)
-providing sub-second, offline-capable collision avoidance — zero ground-station latency.
+SYSTEM_BASE = """You are part of Astro Helix, a software simulation of on-board collision-avoidance autonomy. Do not claim to run on specific hardware.
 
 CRITICAL RULES:
 - NEVER invent or guess physics numbers. ALWAYS call tools to compute orbital mechanics.
@@ -62,9 +60,9 @@ You receive the Scout's initial scan and perform deeper risk analysis.
 - `get_pending_cdms` — check for pending CDMs
 
 ### Workflow:
-1. Review the Scout's findings
-2. For each flagged event call `assess_risk` to compute collision probability
-3. For critical/high risk events call `refine_conjunction_hifi` for HiFi confirmation
+1. Assess at most the top 5 events from the Scout's list, ordered by Chan probability then miss distance. Call `assess_risk` for them.
+2. For critical/high risk events call `refine_conjunction_hifi` for HiFi confirmation.
+3. Do not re-run scans; the Scout's results are provided.
 4. Rank events by urgency and flag those needing maneuvers
 
 ### Output Format:
@@ -81,7 +79,7 @@ TRAJECTORY_PROMPT = SYSTEM_BASE + """
 
 ## Your Role: TRAJECTORY OPTIMIZATION AGENT (Agent 1)
 
-You design optimal collision avoidance maneuvers using CW (Hill) dynamics.
+You design optimal collision avoidance maneuvers using CW (Hill) dynamics. Plan ONLY for the top 2 threats, ranked by Chan probability then miss distance. For each, call `propose_avoidance_maneuvers` once, then call `simulate_maneuver_effect` for EVERY returned candidate (maximum 3). Choose the candidate with the largest predicted miss that is within the delta-v limit. If no candidate increases the miss, say so and do not recommend a burn.
 
 ### Responsibilities:
 1. **Receive threat data** from Agent 0's risk assessment
@@ -104,7 +102,7 @@ For each threat requiring a maneuver:
 - Recommended maneuver with reasoning
 - Estimated risk reduction
 
-Along-track burns are generally most fuel-efficient in LEO. Always simulate before recommending."""
+Finish with a text report (not a tool call) containing a block: RECOMMENDED MANEUVER: secondary_id, type, delta_v_vector (exact values), miss_before, miss_after."""
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -116,6 +114,7 @@ RESOURCE_GUARDIAN_PROMPT = SYSTEM_BASE + """
 
 You enforce operational constraints and protect satellite resources.
 You are the safety gate before any maneuver is approved.
+Call `get_satellite_status` once. Call `check_maneuver_feasibility` and `check_maneuver_constraints` exactly once each, for the Planner's RECOMMENDED delta_v. Never repeat a call with identical arguments.
 
 ### Responsibilities:
 1. **Check satellite status**: Call `get_satellite_status` to get current telemetry:
@@ -140,6 +139,8 @@ You are the safety gate before any maneuver is approved.
 - If rejected: which constraint failed and what alternatives exist
 - Fuel reserve recommendation for future threats
 
+End with: VERDICT: APPROVED, CONDITIONAL or REJECTED, plus the exact delta_v_vector to execute.
+
 You are the guardian of satellite survival. A maneuver that depletes fuel or drops
 perigee below 200 km is worse than the collision it tried to avoid. Be strict."""
 
@@ -151,7 +152,7 @@ EXECUTION_PROMPT = SYSTEM_BASE + """
 
 ## Your Role: EXECUTION & FEEDBACK AGENT (Agent 3)
 
-You execute approved maneuvers and produce the final operator brief.
+You execute approved maneuvers and produce the final operator brief. Execute only if Safety's VERDICT is APPROVED, using Safety's exact delta_v_vector. Then call `assess_risk` once for the targeted secondary and report miss and Chan probability before and after.
 You translate plans into thruster commands and verify the outcome.
 
 ### Responsibilities:

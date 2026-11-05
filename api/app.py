@@ -90,7 +90,7 @@ def status(probe: int = Query(default=0)):
             from langchain_openai import ChatOpenAI
             try:
                 kwargs = config.to_llm_kwargs()
-                kwargs.update(timeout=8, max_tokens=1)
+                kwargs.update(timeout=20, max_tokens=1)
                 ChatOpenAI(**kwargs).invoke("Reply with OK")
                 llm["llm_reachable"] = True
             except Exception as exc:
@@ -100,7 +100,9 @@ def status(probe: int = Query(default=0)):
                     llm["error_kind"] = "llm_auth"
                 elif status_code in (400, 422):
                     llm["error_kind"] = "llm_bad_request"
-                elif any(term in str(exc).lower() for term in ("connect", "timeout", "timed out", "refused", "dns")):
+                elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or any(term in str(exc).lower() for term in ("timeout", "timed out")):
+                    llm["error_kind"] = "llm_timeout"
+                elif any(term in str(exc).lower() for term in ("connect", "refused", "dns")):
                     llm["error_kind"] = "llm_unreachable"
                 else:
                     llm["error_kind"] = "llm_other"
@@ -108,7 +110,8 @@ def status(probe: int = Query(default=0)):
         "satellite": {
             "norad_id": sat.norad_id,
             "name": sat.name,
-            "fuel_pct": round(sat.fuel_kg / sat.config.fuel_capacity_kg * 100, 1),
+            "fuel_kg": round(sat.fuel_kg, 2),
+            "fuel_pct": round(sat.fuel_kg / sat.config.fuel_capacity_kg * 100, 2),
         },
         "llm": llm,
     }

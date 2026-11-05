@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import re
 
 from fastapi.testclient import TestClient
 
@@ -22,16 +23,38 @@ def setup_function():
 
 
 def test_scripted_multi_pipeline_executes_in_order():
+    from langchain_core.tools import tool
+    import agents.graph as graph_module
+
+    @tool("simulate_maneuver_effect")
+    def improved_simulation(secondary_id: int, delta_v: list[float], burn_time_sec: float) -> str:
+        """Return an improving miss distance for the scripted test."""
+        return json.dumps({"before": {"miss_distance_m": 150.0}, "after": {"miss_distance_m": 500.0},
+                           "delta_v_applied": delta_v, "improvement_m": 350.0})
+
+    original_tools = graph_module.PLANNER_TOOLS
+    graph_module.PLANNER_TOOLS = [original_tools[0], improved_simulation, original_tools[2]]
     before = get_satellite().velocity.copy()
-    result = run_avoidance_pipeline(PROMPT, config=LLMConfig(provider="scripted"), mode="multi")
+    try:
+        result = run_avoidance_pipeline(PROMPT, config=LLMConfig(provider="scripted"), mode="multi")
+    finally:
+        graph_module.PLANNER_TOOLS = original_tools
     completed = [e["agent"] for e in result["events"] if e["type"] == "agent_complete"]
     assert completed == ["scout", "analyst", "planner", "safety", "ops_brief"]
     assert any(e["type"] == "maneuver_executed" for e in result["events"])
     assert (get_satellite().velocity != before).any()
     assert result["ops_brief"]
+    assert "RECOMMENDED MANEUVER:" in result["planner_output"]
+    assert "VERDICT: APPROVED" in result["safety_output"]
+    safety_dv = json.loads(re.search(r"delta_v_vector:\s*(\[[^\]]+\])", result["safety_output"]).group(1))
+    execution = next(e for e in result["events"] if e["type"] == "maneuver_executed")
+    executed_dv = execution["delta_v"]
+    assert executed_dv == safety_dv
     risk_calls = [e for e in result["events"] if e["type"] == "tool_result" and e["tool"] == "assess_risk"]
     assert risk_calls
     assert '3600.0' in risk_calls[0]["summary"]
+    ops_risk_calls = [e for e in risk_calls if e["agent"] == "ops_brief"]
+    assert len(ops_risk_calls) == 1
 
 
 def test_scripted_stream_order_and_completion():
@@ -52,7 +75,10 @@ def test_fastapi_scripted_endpoints(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "scripted")
     with TestClient(app) as client:
         assert client.get("/health").status_code == 200
-        assert client.get("/status").json()["llm"]["llm_provider"] == "scripted"
+        status_response = client.get("/status").json()
+        assert status_response["llm"]["llm_provider"] == "scripted"
+        assert status_response["satellite"]["fuel_kg"] == round(get_satellite().fuel_kg, 2)
+        assert status_response["satellite"]["fuel_pct"] == round(get_satellite().fuel_percentage, 2)
         response = client.post("/agent/run", params={"mode": "multi", "prompt": PROMPT})
         assert response.status_code == 200
         assert response.json()["ops_brief"]
@@ -128,3 +154,42 @@ def test_demo_scan_is_cached_until_satellite_state_changes(monkeypatch):
     get_satellite().position[0] += 0.01
     scan_demo_conjunctions.func()
     assert len(calls) == 2
+
+
+def test_execute_maneuver_rejects_over_limit_without_applying():
+    from agents.tools import execute_maneuver_on_satellite
+
+    sat = get_satellite()
+    velocity = sat.velocity.copy()
+    fuel = sat.fuel_kg
+    result = json.loads(execute_maneuver_on_satellite.func([51.0, 0.0, 0.0]))
+    assert result["executed"] is False
+    assert result["error"]
+    assert not (sat.velocity != velocity).any()
+    assert sat.fuel_kg == fuel
+
+
+def test_status_fuel_precision_is_two_decimals():
+    from agents.tools import get_satellite_status
+
+    status = json.loads(get_satellite_status.func())
+    assert status["fuel_kg"] == round(get_satellite().fuel_kg, 2)
+    assert status["fuel_pct"] == round(get_satellite().fuel_percentage, 2)
+
+
+def test_status_probe_reports_timeout_as_llm_timeout(monkeypatch):
+    import langchain_openai
+
+    class TimeoutChat:
+        def __init__(self, **kwargs):
+            assert kwargs["timeout"] == 20
+
+        def invoke(self, prompt):
+            raise TimeoutError("request timed out")
+
+    monkeypatch.setattr("api.app._get_config", lambda: LLMConfig(provider="openai_compat", base_url="https://example.invalid/v1", model="test", api_key="test"))
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", TimeoutChat)
+    with TestClient(app) as client:
+        status = client.get("/status?probe=1").json()
+    assert status["llm"]["llm_reachable"] is False
+    assert status["llm"]["error_kind"] == "llm_timeout"

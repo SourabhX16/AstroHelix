@@ -284,7 +284,10 @@ def simulate_maneuver_effect(
 def get_satellite_status() -> str:
     """Get current satellite telemetry: fuel, power, position, delta-v budget."""
     sat = get_satellite()
-    return json.dumps(sat.get_status(), indent=2, default=str)
+    status = sat.get_status()
+    status["fuel_kg"] = round(sat.fuel_kg, 2)
+    status["fuel_pct"] = round(sat.fuel_percentage, 2)
+    return json.dumps(status, indent=2, default=str)
 
 
 @tool
@@ -352,8 +355,18 @@ def execute_maneuver_on_satellite(delta_v: List[float]) -> str:
     sat = get_satellite()
     dv = np.array(delta_v, dtype=float)
 
+    safety = check_constraints(
+        delta_v=dv.tolist(), primary_position=sat.position, primary_velocity=sat.velocity,
+        mass_kg=sat.total_mass, isp_s=sat.config.isp_s, remaining_fuel_kg=sat.fuel_kg,
+        burn_time_sec=0.0,
+    )
+    if not safety["overall_pass"]:
+        return json.dumps({"error": "Maneuver rejected by execution safety gate", "executed": False,
+                           "fuel_used_kg": 0.0, "checks": safety}, indent=2, default=str)
+
     # Apply maneuver (handles fuel, power, velocity update)
     result = sat.apply_maneuver(dv)
+    result.setdefault("fuel_used_kg", 0.0)
     return json.dumps(result, indent=2, default=str)
 
 
