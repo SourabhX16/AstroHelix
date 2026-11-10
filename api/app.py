@@ -27,7 +27,7 @@ from fastapi.responses import StreamingResponse
 from agents.config import LLMConfig
 from agents.graph import run_avoidance_pipeline, stream_avoidance_pipeline
 from api.demo_data import load_demo_data
-from api.state import get_satellite, reset_state
+from api.state import get_satellite, reset_state, set_pipeline_constraints
 
 logger = logging.getLogger("astro_helix.api")
 logging.basicConfig(level=logging.INFO)
@@ -125,11 +125,13 @@ def status(probe: int = Query(default=0)):
 def agent_run(
     prompt: str = "Scan for conjunction threats against the ISS in the next 24 hours. If any are high risk, propose avoidance maneuvers and check constraints. Use the demo dataset.",
     mode: str = "multi",
+    max_dv: float = 0.35, max_burns: int = 1, axis: str = "along-track", horizon_h: float = 24.0, reset: bool = True,
 ):
     """
     Run the agent pipeline synchronously and return the full result.
     Use /agent/stream for real-time SSE updates.
     """
+    _prepare_run(max_dv, max_burns, axis, horizon_h, reset)
     config = _get_config()
     result = run_avoidance_pipeline(prompt, config=config, mode=mode)
     return result
@@ -146,15 +148,19 @@ async def agent_stream(
         description="Natural language request for the agent",
     ),
     mode: str = Query(default="multi", description="Agent mode: multi or single"),
+    max_dv: float = Query(default=0.35), max_burns: int = Query(default=1), axis: str = Query(default="along-track"), horizon_h: float = Query(default=24.0), reset: bool = Query(default=True),
 ):
     """
     Stream agent pipeline events via Server-Sent Events (SSE).
     The frontend terminal drawer connects to this endpoint.
     """
+    _prepare_run(max_dv, max_burns, axis, horizon_h, reset)
     config = _get_config()
 
     async def event_generator():
         try:
+            if reset:
+                yield f"data: {json.dumps({'type': 'info', 'message': 'scenario reset'})}\n\n"
             async for event in stream_avoidance_pipeline(prompt, config=config, mode=mode):
                 data = json.dumps(event, default=str)
                 yield f"data: {data}\n\n"
@@ -173,6 +179,13 @@ async def agent_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _prepare_run(max_dv: float, max_burns: int, axis: str, horizon_h: float, reset: bool) -> None:
+    if reset:
+        reset_state()
+        load_demo_data()
+    set_pipeline_constraints({"max_dv_ms": max_dv, "max_burns": max_burns, "axis": axis, "horizon_h": horizon_h})
 
 
 # ─────────────────────────────────────────────────────────────────────────

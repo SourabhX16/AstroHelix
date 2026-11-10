@@ -133,6 +133,8 @@ _maneuver_lock = threading.RLock()
 _maneuver_pipeline: Dict[str, Any] = {
     "events": {}, "risk_assessments": {}, "last_search": None,
     "recommended_maneuver": None, "checks": {},
+    "constraints": {"max_dv_ms": 0.35, "max_burns": 1, "axis": "along-track", "horizon_h": 24.0},
+    "scan_events": None,
 }
 
 
@@ -142,17 +144,28 @@ def reset_maneuver_pipeline_state() -> None:
         _maneuver_pipeline.update({
             "events": {}, "risk_assessments": {}, "last_search": None,
             "recommended_maneuver": None, "checks": {},
+            "scan_events": None,
         })
 
 
 def record_conjunction_events(events: List[Dict[str, Any]]) -> None:
     with _maneuver_lock:
+        deduped = {}
         for event in events:
             sid = event.get("secondary_id")
             if sid is not None:
-                current = _maneuver_pipeline["events"].get(int(sid))
+                current = deduped.get(int(sid))
                 if current is None or float(event.get("miss_distance_m", float("inf"))) < float(current.get("miss_distance_m", float("inf"))):
-                    _maneuver_pipeline["events"][int(sid)] = copy.deepcopy(event)
+                    deduped[int(sid)] = copy.deepcopy(event)
+        _maneuver_pipeline["scan_events"] = deduped
+        _maneuver_pipeline["events"] = copy.deepcopy(deduped)
+
+
+def get_scan_event(secondary_id: int) -> Optional[Dict[str, Any]]:
+    with _maneuver_lock:
+        events = _maneuver_pipeline.get("scan_events")
+        event = events.get(int(secondary_id)) if events is not None else None
+        return copy.deepcopy(event)
 
 
 def record_risk_assessment(secondary_id: int, assessment: Dict[str, Any]) -> None:
@@ -215,6 +228,16 @@ def record_maneuver_check(name: str, result: Dict[str, Any]) -> None:
 def get_maneuver_checks() -> Dict[str, Any]:
     with _maneuver_lock:
         return copy.deepcopy(_maneuver_pipeline["checks"])
+
+
+def set_pipeline_constraints(constraints: Dict[str, Any]) -> None:
+    with _maneuver_lock:
+        _maneuver_pipeline["constraints"] = copy.deepcopy(constraints)
+
+
+def get_pipeline_constraints() -> Dict[str, Any]:
+    with _maneuver_lock:
+        return copy.deepcopy(_maneuver_pipeline["constraints"])
 
 
 def get_catalog() -> OrbitalCatalog:

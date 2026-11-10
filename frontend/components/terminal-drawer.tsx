@@ -110,10 +110,19 @@ export const TerminalDrawer = forwardRef<TerminalDrawerHandle, TerminalDrawerPro
     abortRef.current = ctrl
 
     try {
-      let url = "/api/agent/stream?mode=multi"
+      const constraintsResponse = await fetch("/api/constraints", { cache: "no-store", signal: ctrl.signal })
+      const constraints = constraintsResponse.ok ? await constraintsResponse.json() : {}
+      const params = new URLSearchParams({
+        mode: "multi",
+        max_dv: String(constraints.max_dv_ms ?? constraints.max_dv ?? 0.35),
+        max_burns: String(constraints.max_burns ?? 1),
+        axis: String(constraints.axis ?? "along-track"),
+        horizon_h: String(constraints.horizon_h ?? 24),
+      })
       if (prompt) {
-        url += `&prompt=${encodeURIComponent(prompt)}`
+        params.set("prompt", prompt)
       }
+      const url = `/api/agent/stream?${params.toString()}`
       const res = await fetch(url, { signal: ctrl.signal })
 
       if (!res.ok || !res.body) {

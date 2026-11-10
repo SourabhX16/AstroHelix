@@ -166,6 +166,48 @@ def test_execute_maneuver_rejects_over_limit_without_applying():
     assert sat.fuel_kg == fuel
 
 
+def test_ui_constraint_caps_check_and_recommended_execution():
+    from api.state import set_pipeline_constraints
+    from agents.tools import check_maneuver_constraints, execute_recommended_maneuver
+    set_pipeline_constraints({"max_dv_ms": 0.35, "max_burns": 1, "axis": "along-track", "horizon_h": 24})
+    _store_test_recommendation((1.0, 0.0, 0.0), verdict="APPROVED")
+    sat = get_satellite()
+    velocity, fuel = sat.velocity.copy(), sat.fuel_kg
+    checked = json.loads(check_maneuver_constraints.func())
+    assert checked["constraints"]["max_delta_v"]["pass"] is False
+    executed = json.loads(execute_recommended_maneuver.func())
+    assert executed["executed"] is False
+    assert (sat.velocity == velocity).all() and sat.fuel_kg == fuel
+
+
+def test_agent_run_resets_fuel_and_stores_constraints():
+    from api.state import get_pipeline_constraints
+    from agents.tools import execute_maneuver_on_satellite
+    with TestClient(app) as client:
+        params = {"mode": "single", "prompt": PROMPT, "max_dv": 0.35, "max_burns": 1, "axis": "radial", "horizon_h": 3}
+        client.post("/agent/run", params=params)
+        first = get_satellite().fuel_kg
+        # Disturb fuel through an ordinary maneuver, then rely on default reset.
+        execute_maneuver_on_satellite.func([0.01, 0.0, 0.0])
+        client.post("/agent/run", params=params)
+        second = get_satellite().fuel_kg
+    assert first == second
+    assert get_pipeline_constraints() == {"max_dv_ms": 0.35, "max_burns": 1, "axis": "radial", "horizon_h": 3.0}
+
+
+def test_demo_scan_uses_configured_horizon(monkeypatch):
+    from api.state import set_pipeline_constraints
+    from agents import tools as agent_tools
+    seen = []
+    monkeypatch.setattr(agent_tools, "screen_conjunctions", lambda **kwargs: (seen.append(kwargs["lookahead_sec"]) or []))
+    monkeypatch.setattr(agent_tools, "load_demo_data", lambda: None)
+    import api.demo_data as dm
+    monkeypatch.setattr(dm, "_SCAN_CACHE", None)
+    set_pipeline_constraints({"max_dv_ms": .35, "max_burns": 1, "axis": "along-track", "horizon_h": 7})
+    agent_tools.scan_demo_conjunctions.func()
+    assert seen == [7 * 3600]
+
+
 def test_status_fuel_precision_is_two_decimals():
     from agents.tools import get_satellite_status
 

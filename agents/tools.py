@@ -7,6 +7,7 @@ into LangChain tools that agents can call via function-calling.
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -17,16 +18,19 @@ from api.demo_data import load_demo_data
 from api.state import (
     get_catalog, get_cdm_inbox, get_satellite, get_top_threat,
     record_conjunction_events, record_risk_assessment,
+    get_pipeline_constraints,
+    get_scan_event,
     set_last_maneuver_search, get_last_maneuver_search,
     set_recommended_maneuver, get_recommended_maneuver,
     update_recommended_maneuver, record_maneuver_check, get_maneuver_checks,
 )
-from tools.constraints import check_constraints
+from tools.constraints import check_constraints, effective_max_dv_mps
 from tools.maneuver import simulate_maneuver
 from tools.propagate import propagate_orbit
 from tools.refine import refine_conjunction
 from tools.risk import assess_conjunction_risk
 from tools.screening import screen_conjunctions
+from tools.screening import propagate_state
 
 
 def _compact_events(events: list[dict]) -> tuple[list[dict], int]:
@@ -78,7 +82,7 @@ def scan_conjunctions(lookahead_hours: float = 24.0, threshold_km: float = 50.0)
         primary_pos=sat.position,
         primary_vel=sat.velocity,
         debris_list=debris_list,
-        lookahead_sec=lookahead_hours * 3600,
+        lookahead_sec=float(get_pipeline_constraints().get("horizon_h", lookahead_hours)) * 3600,
         threshold_km=threshold_km,
     )
     shown, total = _compact_events(events)
@@ -114,7 +118,7 @@ def scan_demo_conjunctions() -> str:
         primary_pos=sat.position,
         primary_vel=sat.velocity,
         debris_list=debris_list,
-        lookahead_sec=86400,
+        lookahead_sec=float(get_pipeline_constraints().get("horizon_h", 24.0)) * 3600,
         threshold_km=50.0,
     )
     shown, total = _compact_events(events)
@@ -159,7 +163,11 @@ def assess_risk(
     if obj is None:
         return json.dumps({"error": f"Object {secondary_id} not found in catalog"})
 
-    if tca_offset_sec is None:
+    scan_event = get_scan_event(secondary_id)
+    if scan_event:
+        tca_offset_sec = float(scan_event["tca_offset_sec"])
+        miss_distance_m = float(scan_event["miss_distance_m"])
+    elif tca_offset_sec is None:
         cdm = next(
             (message for message in reversed(get_cdm_inbox().get_all())
              if message.get("secondary_id") == secondary_id),
@@ -172,7 +180,7 @@ def assess_risk(
                 primary_pos=sat.position,
                 primary_vel=sat.velocity,
                 debris_list=[obj.to_dict()],
-                lookahead_sec=86400.0,
+                lookahead_sec=float(get_pipeline_constraints().get("horizon_h", 24.0)) * 3600,
                 threshold_km=50000.0,
             )
             if events:
@@ -244,8 +252,9 @@ def propose_avoidance_maneuvers(secondary_id: int) -> str:
     if top is None:
         return json.dumps({"error": "No ranked threat is available from Scout and Analyst", "candidates": [], "no_improving_candidate": True})
     secondary_id = int(top["secondary_id"])
-    tca_offset_sec = float(top.get("tca_offset_sec", top.get("tca_sec", 0.0)))
-    miss_distance_m = float(top.get("miss_distance_m", 0.0))
+    scan_event = get_scan_event(secondary_id)
+    tca_offset_sec = float(scan_event["tca_offset_sec"] if scan_event else top.get("tca_offset_sec", top.get("tca_sec", 0.0)))
+    miss_distance_m = float(scan_event["miss_distance_m"] if scan_event else top.get("miss_distance_m", 0.0))
     obj = catalog.get(secondary_id)
     if obj is None:
         return json.dumps({"error": f"Object {secondary_id} not found in catalog"})
@@ -260,31 +269,33 @@ def propose_avoidance_maneuvers(secondary_id: int) -> str:
         ("radial", radial), ("radial", -radial),
         ("cross-track", cross), ("cross-track", -cross),
     )
-    max_dv = float(sat.config.max_dv_per_burn_ms)
-    magnitudes = sorted({float(value) for value in (0.05, 0.1, 0.2, max_dv) if 0 < value <= max_dv})
+    max_dv = effective_max_dv_mps()
+    target_miss = float(os.getenv("TARGET_MISS_M", "2000"))
+    magnitudes = sorted({float(value) for value in (0.02, 0.05, 0.1, 0.2, max_dv) if 0 < value <= max_dv})
     # Resolve the TCA neighborhood to keep the grid search focused on the event.
     duration_sec = min(86400.0, max(600.0, float(tca_offset_sec) + 300.0))
-    evaluated = []
-    for maneuver_type, direction in directions:
-        for magnitude in magnitudes:
+    def evaluate(maneuver_type, direction, magnitude):
             dv = (direction * magnitude).tolist()
             constraints = check_constraints(
                 delta_v=dv, primary_position=sat.position, primary_velocity=sat.velocity,
                 mass_kg=sat.total_mass, isp_s=sat.config.isp_s,
                 remaining_fuel_kg=sat.fuel_kg, burn_time_sec=0.0, max_dv_mps=max_dv,
             )
-            if not constraints["overall_pass"]:
-                continue
+            if not constraints["overall_pass"] or not constraints["constraints"]["no_secondary_conjunctions"]["pass"]:
+                return None
             result = simulate_maneuver(
                 primary_pos=sat.position, primary_vel=sat.velocity,
                 secondary_pos=obj.position, secondary_vel=obj.velocity,
                 delta_v=dv, burn_time_sec=0.0, duration_sec=duration_sec,
             )
-            before = float(result["before"]["miss_distance_m"])
-            after = float(result["after"]["miss_distance_m"])
+            before = float(miss_distance_m)
+            p = propagate_state(sat.position, sat.velocity + direction * magnitude, tca_offset_sec, dt=2.0)
+            s = propagate_state(obj.position, obj.velocity, tca_offset_sec, dt=2.0)
+            after = float(np.linalg.norm(p.r - s.r))
             improvement = after - before
             if improvement > 0:
-                evaluated.append({
+                fuel = sat.total_mass * (1 - np.exp(-magnitude / (sat.config.isp_s * 9.80665)))
+                return {
                     "type": maneuver_type,
                     "delta_v_vector": dv,
                     "delta_v_magnitude_ms": round(magnitude, 4),
@@ -294,9 +305,41 @@ def propose_avoidance_maneuvers(secondary_id: int) -> str:
                     "predicted_miss_distance_m": after,
                     "miss_improvement_m": round(improvement, 1),
                     "constraints": constraints,
-                })
-    evaluated.sort(key=lambda candidate: (-candidate["miss_improvement_m"], candidate["delta_v_magnitude_ms"]))
-    candidates = evaluated[:3]
+                    "delta_v_ms": round(magnitude, 4), "fuel_required_kg": round(float(fuel), 4),
+                    "chan_after": float(top.get("collision_probability_chan", 0.0)),
+                }
+            return None
+    best_partial = None
+    sufficient = []
+    for maneuver_type, direction in directions:
+        vals = []
+        for magnitude in magnitudes:
+            candidate = evaluate(maneuver_type, direction, magnitude)
+            vals.append((magnitude, candidate))
+            if candidate and (best_partial is None or candidate["miss_after"] > best_partial["miss_after"]):
+                best_partial = candidate
+        reached = [(mag, c) for mag, c in vals if c and c["miss_after"] >= target_miss]
+        if reached:
+            high, high_c = min(reached, key=lambda item: item[0])
+            lower = max((mag for mag, c in vals if mag < high and (c is None or c["miss_after"] < target_miss)), default=0.0)
+            for _ in range(12):
+                mid = (lower + high) / 2
+                cand = evaluate(maneuver_type, direction, mid)
+                if cand and cand["miss_after"] >= target_miss:
+                    high, high_c = mid, cand
+                else:
+                    lower = mid
+            sufficient.append(high_c)
+    candidates = []
+    if sufficient:
+        sufficient.sort(key=lambda c: c["delta_v_ms"])
+        preferred = get_pipeline_constraints().get("axis", "along-track")
+        minimum = sufficient[0]["delta_v_ms"]
+        near = [c for c in sufficient if c["delta_v_ms"] <= minimum * 1.1]
+        candidates = [next((c for c in near if c["type"] == preferred), sufficient[0])]
+    elif best_partial:
+        best_partial["partial"] = True
+        candidates = [best_partial]
     for index, candidate in enumerate(candidates):
         candidate["candidate_index"] = index
     elapsed = round(time.perf_counter() - started, 3)
@@ -307,6 +350,7 @@ def propose_avoidance_maneuvers(secondary_id: int) -> str:
         "candidates": candidates,
         "runtime_sec": elapsed,
         "no_improving_candidate": not candidates,
+        "partial": bool(candidates and candidates[0].get("partial")),
     }
     top_probability = float(top.get("collision_probability_chan", 0.0))
     search["chan_probability"] = top_probability
@@ -340,6 +384,7 @@ def record_recommended_maneuver(secondary_id: int, candidate_index: int) -> str:
         "reason": None,
         "candidate_index": candidate_index,
         "burn_time_sec": candidate["burn_time_sec"],
+        "tca_offset_sec": float(search.get("tca_offset_sec", 0.0)),
         "executed": False,
     }
     set_recommended_maneuver(record)
@@ -406,7 +451,7 @@ def check_maneuver_constraints() -> str:
         isp_s=sat.config.isp_s,
         remaining_fuel_kg=sat.fuel_kg,
         burn_time_sec=float(recommended.get("burn_time_sec", 0.0)),
-        max_dv_mps=sat.config.max_dv_per_burn_ms,
+        max_dv_mps=effective_max_dv_mps(),
     )
     result["checked_delta_v_vector"] = recommended["delta_v_vector"]
     record_maneuver_check("constraints", result)
@@ -484,7 +529,7 @@ def execute_maneuver_on_satellite(delta_v: List[float]) -> str:
     safety = check_constraints(
         delta_v=dv.tolist(), primary_position=sat.position, primary_velocity=sat.velocity,
         mass_kg=sat.total_mass, isp_s=sat.config.isp_s, remaining_fuel_kg=sat.fuel_kg,
-        burn_time_sec=0.0, max_dv_mps=sat.config.max_dv_per_burn_ms,
+        burn_time_sec=0.0, max_dv_mps=effective_max_dv_mps(),
     )
     if not safety["overall_pass"]:
         return json.dumps({"error": "Maneuver rejected by execution safety gate", "executed": False,
@@ -520,7 +565,7 @@ def execute_recommended_maneuver() -> str:
     checks = check_constraints(
         delta_v=dv.tolist(), primary_position=sat.position, primary_velocity=sat.velocity,
         mass_kg=sat.total_mass, isp_s=sat.config.isp_s, remaining_fuel_kg=sat.fuel_kg,
-        burn_time_sec=float(recommended.get("burn_time_sec", 0.0)), max_dv_mps=sat.config.max_dv_per_burn_ms,
+        burn_time_sec=float(recommended.get("burn_time_sec", 0.0)), max_dv_mps=effective_max_dv_mps(),
     )
     if not checks.get("overall_pass"):
         return json.dumps({"error": "Maneuver rejected by execution safety gate", "executed": False,
@@ -528,7 +573,25 @@ def execute_recommended_maneuver() -> str:
     result = sat.apply_maneuver(dv)
     result.setdefault("fuel_used_kg", 0.0)
     if result.get("executed"):
-        update_recommended_maneuver(executed=True, fuel_used_kg=result["fuel_used_kg"], execution=result)
+        tca = float(recommended.get("tca_offset_sec", get_last_maneuver_search().get("tca_offset_sec", 0.0)))
+        obj = get_catalog().get(int(recommended["secondary_id"]))
+        verification = {}
+        if obj is not None:
+            def miss_at(offset):
+                p = propagate_state(sat.position, sat.velocity, offset, dt=2.0)
+                s = propagate_state(obj.position, obj.velocity, offset, dt=2.0)
+                return float(np.linalg.norm(p.r - s.r))
+            predicted = float(recommended.get("miss_after", 0.0))
+            actual = miss_at(tca)
+            samples = [miss_at(max(0.0, tca + offset)) for offset in range(-300, 301, 10)]
+            verification = {
+                "predicted_miss_at_original_tca_m": predicted,
+                "actual_miss_at_original_tca_m": actual,
+                "minimum_miss_within_300s_m": min(samples),
+                "discrepancy_flag": abs(actual - predicted) / max(abs(predicted), 1.0) > 0.15,
+            }
+        update_recommended_maneuver(executed=True, fuel_used_kg=result["fuel_used_kg"], execution=result, post_burn_verification=verification)
+        result["post_burn_verification"] = verification
     return json.dumps(result, indent=2, default=str)
 
 

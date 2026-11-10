@@ -11,11 +11,16 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from engine.config.settings import RE, GM
+from api.state import get_pipeline_constraints
 
 # Default constraint parameters
 G0 = 9.80665
 MIN_PERIGEE_ALT_M = 200_000.0  # 200 km minimum altitude
 MAX_DV_PER_BURN_MPS = 50.0     # 50 m/s maximum single-burn delta-v
+
+
+def effective_max_dv_mps() -> float:
+    return min(float(get_pipeline_constraints().get("max_dv_ms", 0.35)), MAX_DV_PER_BURN_MPS)
 
 
 def check_constraints(
