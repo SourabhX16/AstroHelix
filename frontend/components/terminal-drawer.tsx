@@ -28,6 +28,24 @@ function formatTime(ts?: number): string {
   return d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
 }
 
+function readable(value: unknown, fallback = ""): string {
+  if (typeof value !== "string") return fallback
+  const text = value.replace(/[\r\n]+/g, " ").trim()
+  if (!text) return fallback
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === "object") return "result available"
+  } catch {
+    // Ordinary prose stays readable; structured payloads are hidden below.
+  }
+  return text
+}
+
+function formatMeters(value: unknown): string {
+  const number = Number(value)
+  return Number.isFinite(number) ? `${Math.round(number).toLocaleString("en-US")} m` : "unknown miss"
+}
+
 function eventToLog(event: Record<string, unknown>, id: number): AgentLog {
   const ts = formatTime(event.timestamp as number | undefined)
   const agent = (event.agent as string) ?? ""
@@ -46,12 +64,12 @@ function eventToLog(event: Record<string, unknown>, id: number): AgentLog {
         color: "text-yellow-300",
       }
     case "thinking":
-      return { id, timestamp: ts, text: `${agent}: ${event.text ?? "reasoning..."}`, color: "text-gray-400 italic" }
+      return { id, timestamp: ts, text: `${agent}: ${readable(event.text, "reasoning...")}`, color: "text-gray-400 italic" }
     case "tool_result":
       return {
         id,
         timestamp: ts,
-        text: `${agent}.${event.tool}: ${(event.summary as string)?.slice(0, 120) ?? "done"}`,
+        text: `${agent}.${event.tool}: ${readable(event.summary, "done").slice(0, 120)}`,
         color: "text-emerald-300",
       }
     case "agent_complete":
@@ -65,19 +83,42 @@ function eventToLog(event: Record<string, unknown>, id: number): AgentLog {
       return {
         id,
         timestamp: ts,
-        text: `${agent}: ${(event.content as string)?.slice(0, 150) ?? ""}`,
+        text: `${agent}: ${readable(event.content).slice(0, 150)}`,
         color: "text-blue-300",
       }
     case "maneuver_executed":
       return { id, timestamp: ts, text: `${agent}: maneuver applied — updating globe orbit`, color: "text-emerald-400 font-bold" }
+    case "maneuver_search": {
+      const search = (event.search ?? {}) as Record<string, unknown>
+      const candidate = ((search.candidates as Record<string, unknown>[] | undefined) ?? [])[0]
+      const direction = candidate?.type ? ` ${candidate.type}` : ""
+      const dv = Number(candidate?.delta_v_ms)
+      const dvText = Number.isFinite(dv) ? `${dv.toFixed(2)} m/s${direction}` : "no candidate"
+      const missBefore = formatMeters(candidate?.miss_before ?? search.miss_distance_m)
+      const missAfter = formatMeters(candidate?.miss_after)
+      return { id, timestamp: ts, text: `${agent}: searched maneuvers for ${search.secondary_id ?? "threat"}, ${candidate ? `best ${dvText}, miss ${missBefore} → ${missAfter}` : "no improving candidate"}`, color: "text-cyan-300" }
+    }
+    case "recommended_maneuver": {
+      const record = (event.recommended_maneuver ?? {}) as Record<string, unknown>
+      const stage = String(event.stage ?? "updated").replaceAll("_", " ")
+      const sid = record.secondary_id ? ` for ${record.secondary_id}` : ""
+      const verdict = record.verdict ? ` (${record.verdict})` : ""
+      const dv = Number(record.delta_v_magnitude_ms ?? record.delta_v_ms)
+      const detail = Number.isFinite(dv) ? `, ${dv.toFixed(2)} m/s` : ""
+      return { id, timestamp: ts, text: `${agent}: ${stage}${sid}${detail}${verdict}`, color: "text-amber-300" }
+    }
+    case "iteration_limit":
+      return { id, timestamp: ts, text: `${agent}: reached the iteration limit`, color: "text-orange-300" }
+    case "info":
+      return { id, timestamp: ts, text: readable(event.message, "pipeline information"), color: "text-amber-400" }
     case "pipeline_complete":
       return { id, timestamp: ts, text: "pipeline complete ✓", color: "text-green-500 font-bold" }
     case "error":
-      return { id, timestamp: ts, text: `ERROR: ${event.message}`, color: "text-red-400" }
+      return { id, timestamp: ts, text: `ERROR: ${readable(event.message, "pipeline failed")}`, color: "text-red-400" }
     case "done":
       return { id, timestamp: ts, text: "stream closed", color: "text-gray-500" }
     default:
-      return { id, timestamp: ts, text: JSON.stringify(event).slice(0, 120), color: "text-gray-400" }
+      return { id, timestamp: ts, text: `${type || "event"}: update received`, color: "text-gray-400" }
   }
 }
 

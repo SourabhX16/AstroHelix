@@ -5,8 +5,7 @@ import { Loader2, RefreshCw, Search } from "lucide-react"
 
 const DEFAULT_NORAD = "25544"
 const DEFAULT_MAX_ROWS = 8
-const DEFAULT_FEED_POLL_MS = 5_000
-const MANUAL_FEED_POLL_MS = 5_000
+const FEED_POLL_MS = 30_000
 
 interface TargetResponse {
   noradId: number
@@ -98,6 +97,10 @@ export function LeftPanelContent({ onPrimaryIdChange, activePrimaryId, onRiskCha
   const [detailsLoading, setDetailsLoading] = useState(false)
   const [feedLoading, setFeedLoading] = useState(false)
   const [toastMessage, setToastMessage] = useState<string | null>(null)
+  const feedRequestRef = useRef<AbortController | null>(null)
+  const lastFeedRequestAtRef = useRef(0)
+
+  useEffect(() => () => feedRequestRef.current?.abort(), [])
 
   useEffect(() => {
     if (!toastMessage) return
@@ -107,6 +110,12 @@ export function LeftPanelContent({ onPrimaryIdChange, activePrimaryId, onRiskCha
   }, [toastMessage])
 
   const loadFeed = useCallback(async (noradId: number, options?: { forceRefresh?: boolean }) => {
+    if (feedRequestRef.current) return
+    const now = Date.now()
+    if (!options?.forceRefresh && now - lastFeedRequestAtRef.current < FEED_POLL_MS) return
+    lastFeedRequestAtRef.current = now
+    const controller = new AbortController()
+    feedRequestRef.current = controller
     setFeedLoading(true)
 
     try {
@@ -120,6 +129,7 @@ export function LeftPanelContent({ onPrimaryIdChange, activePrimaryId, onRiskCha
 
       const response = await fetch(`/api/feed?${query.toString()}`, {
         cache: "no-store",
+        signal: controller.signal,
       })
       if (!response.ok) {
         const error = await response.json()
@@ -136,10 +146,12 @@ export function LeftPanelContent({ onPrimaryIdChange, activePrimaryId, onRiskCha
           : "No conjunction events found in the selected horizon.")
       }
     } catch (err) {
+      if (controller.signal.aborted) return
       setFeed(null)
       onRiskChange?.("LOW")
       setToastMessage(err instanceof Error ? err.message : "Live conjunction feed unavailable.")
     } finally {
+      if (feedRequestRef.current === controller) feedRequestRef.current = null
       setFeedLoading(false)
     }
   }, [onRiskChange, onFeedUpdate])
@@ -191,10 +203,9 @@ export function LeftPanelContent({ onPrimaryIdChange, activePrimaryId, onRiskCha
   useEffect(() => {
     if (!activeNorad) return
 
-    const pollMs = activeNorad === -1 ? MANUAL_FEED_POLL_MS : DEFAULT_FEED_POLL_MS
     const interval = window.setInterval(() => {
       void loadFeed(activeNorad)
-    }, pollMs)
+    }, FEED_POLL_MS)
 
     return () => window.clearInterval(interval)
   }, [activeNorad, loadFeed])

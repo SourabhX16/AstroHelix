@@ -118,6 +118,12 @@ def _create_agent_node(
             "llm_provider": config.provider,
             "timestamp": time.time(),
         }, events)
+        if config.provider == "scripted" and agent_name in {"scout", "astro_helix"}:
+            _emit({
+                "type": "info",
+                "message": "LLM provider: scripted policy (no AI model)",
+                "timestamp": time.time(),
+            }, events)
 
         # Build messages: system prompt + all prior messages + handoff context
         msgs: List[BaseMessage] = [SystemMessage(content=system_prompt)]
@@ -458,6 +464,7 @@ def run_avoidance_pipeline(
     Returns:
         dict with ops_brief, events, and intermediate outputs
     """
+    config = config or LLMConfig.from_env()
     reset_maneuver_pipeline_state()
     if mode == "multi":
         graph = build_avoidance_graph(config)
@@ -503,6 +510,7 @@ async def stream_avoidance_pipeline(
     async SSE generator in real time, instead of batching per-node.
     """
     eq: queue_module.Queue = queue_module.Queue()
+    config = config or LLMConfig.from_env()
 
     reset_maneuver_pipeline_state()
     if mode == "multi":
