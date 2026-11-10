@@ -17,7 +17,7 @@ from langchain_core.tools import tool
 from api.demo_data import load_demo_data
 from api.state import (
     get_catalog, get_cdm_inbox, get_satellite, get_top_threat,
-    record_conjunction_events, record_risk_assessment,
+    record_conjunction_events, record_scan_events, record_risk_assessment,
     get_pipeline_constraints,
     get_scan_event,
     set_last_maneuver_search, get_last_maneuver_search,
@@ -86,7 +86,7 @@ def scan_conjunctions(lookahead_hours: float = 24.0, threshold_km: float = 50.0)
         threshold_km=threshold_km,
     )
     shown, total = _compact_events(events)
-    record_conjunction_events(shown)
+    record_scan_events(shown)
     return json.dumps({
         "total_screened": len(debris_list),
         "events_found": len(events),
@@ -112,6 +112,8 @@ def scan_demo_conjunctions() -> str:
         debris_list = [obj.to_dict() for obj in get_catalog().list_debris()]
     signature = json.dumps({"sat": [sat.position.tolist(), sat.velocity.tolist()], "debris": debris_list}, sort_keys=True)
     if demo_data._SCAN_CACHE and demo_data._SCAN_CACHE[0] == signature:
+        cached_events = json.loads(demo_data._SCAN_CACHE[1]).get("events", [])
+        record_scan_events(cached_events)
         return demo_data._SCAN_CACHE[1]
 
     events = screen_conjunctions(
@@ -122,7 +124,7 @@ def scan_demo_conjunctions() -> str:
         threshold_km=50.0,
     )
     shown, total = _compact_events(events)
-    record_conjunction_events(shown)
+    record_scan_events(shown)
     result = json.dumps({
         "demo_loaded": True,
         "debris_count": len(debris_list),
@@ -167,14 +169,15 @@ def assess_risk(
     if scan_event:
         tca_offset_sec = float(scan_event["tca_offset_sec"])
         miss_distance_m = float(scan_event["miss_distance_m"])
-    elif tca_offset_sec is None:
+    else:
         cdm = next(
             (message for message in reversed(get_cdm_inbox().get_all())
              if message.get("secondary_id") == secondary_id),
             None,
         )
         if cdm is not None:
-            tca_offset_sec = float(cdm["tca_offset_sec"])
+            tca_offset_sec = float(cdm["tca_offset_sec"]) if tca_offset_sec is None else tca_offset_sec
+            miss_distance_m = float(cdm["miss_distance_m"]) if miss_distance_m is None else miss_distance_m
         else:
             events = screen_conjunctions(
                 primary_pos=sat.position,
@@ -183,9 +186,9 @@ def assess_risk(
                 lookahead_sec=float(get_pipeline_constraints().get("horizon_h", 24.0)) * 3600,
                 threshold_km=50000.0,
             )
-            if events:
+            if events and tca_offset_sec is None:
                 tca_offset_sec = float(events[0]["tca_offset_sec"])
-            else:
+            elif tca_offset_sec is None:
                 tca_offset_sec = 0.0
 
     result = assess_conjunction_risk(
@@ -291,14 +294,14 @@ def propose_avoidance_maneuvers(secondary_id: int) -> str:
             return {
                     "type": maneuver_type,
                     "delta_v_vector": dv,
-                    "delta_v_magnitude_ms": round(magnitude, 4),
+                    "delta_v_magnitude_ms": magnitude,
                     "burn_time_sec": 0.0,
                     "miss_before": before,
                     "miss_after": after,
                     "predicted_miss_distance_m": after,
                     "miss_improvement_m": round(improvement, 1),
                     "constraints": constraints,
-                    "delta_v_ms": round(magnitude, 4), "fuel_required_kg": round(float(fuel), 4),
+                    "delta_v_ms": magnitude, "fuel_required_kg": round(float(fuel), 4),
                     "chan_after": float(top.get("collision_probability_chan", 0.0)),
             }
         return None

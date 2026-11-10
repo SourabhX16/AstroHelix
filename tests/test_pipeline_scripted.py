@@ -289,7 +289,8 @@ def test_deterministic_search_handles_the_150m_threat():
         assert len(search["candidates"]) <= 3
         assert all(candidate["miss_after"] > candidate["miss_before"] for candidate in search["candidates"])
         chosen = search["candidates"][0]
-        assert chosen["delta_v_ms"] <= 0.35
+        from api.state import get_pipeline_constraints
+        assert chosen["delta_v_ms"] <= get_pipeline_constraints()["max_dv_ms"]
         assert chosen["fuel_required_kg"] >= 0
         assert {"miss_before", "miss_after", "chan_after"} <= chosen.keys()
         assert chosen["miss_after"] >= float(__import__("os").getenv("TARGET_MISS_M", "2000"))
@@ -301,10 +302,63 @@ def test_deterministic_search_handles_the_150m_threat():
             search["tca_offset_sec"], dt=2.0,
         )
         secondary = agent_tools.propagate_state(obj.position, obj.velocity, search["tca_offset_sec"], dt=2.0)
-        assert __import__("numpy").linalg.norm(smaller.r - secondary.r) < chosen["miss_after"]
+        smaller_miss = __import__("numpy").linalg.norm(smaller.r - secondary.r)
+        assert smaller_miss < float(__import__("os").getenv("TARGET_MISS_M", "2000"))
     else:
         assert search["no_improving_candidate"] is True
         assert search["message"] == "no improving candidate within constraints"
+
+
+def test_search_reports_partial_and_no_improving_candidate(monkeypatch):
+    from agents import tools as agent_tools
+    from api.state import record_risk_assessment
+    from types import SimpleNamespace
+
+    scan = json.loads(scan_demo_conjunctions.func())
+    event = next(item for item in scan["events"] if item["secondary_id"] == 90005)
+    record_risk_assessment(90005, {"collision_probability_chan": 1.0})
+    monkeypatch.setenv("TARGET_MISS_M", "100000000")
+    partial = json.loads(agent_tools.propose_avoidance_maneuvers.func(90005))
+    assert partial["partial"] is True
+    assert partial["candidates"][0]["miss_after"] > event["miss_distance_m"]
+    assert partial["candidates"][0]["miss_after"] < 100000000
+
+    monkeypatch.setattr(agent_tools, "propagate_state", lambda *args, **kwargs: SimpleNamespace(r=__import__("numpy").zeros(3), v=__import__("numpy").zeros(3)))
+    no_candidate = json.loads(agent_tools.propose_avoidance_maneuvers.func(90005))
+    assert no_candidate["no_improving_candidate"] is True
+    assert no_candidate["candidates"] == []
+
+
+def test_scan_event_values_are_authoritative_for_all_demo_objects(monkeypatch):
+    from agents import tools as agent_tools
+    from api.state import get_last_maneuver_search, record_risk_assessment, record_scan_events, reset_maneuver_pipeline_state
+
+    scan = json.loads(scan_demo_conjunctions.func())
+    events = {item["secondary_id"]: item for item in scan["events"]}
+    assert len(events) == 8
+    captured = {}
+    original_assess = agent_tools.assess_conjunction_risk
+
+    def capture_assess(**kwargs):
+        captured["risk"] = (kwargs["tca_offset_sec"], kwargs["miss_distance_m"])
+        return original_assess(**kwargs)
+
+    monkeypatch.setattr(agent_tools, "assess_conjunction_risk", capture_assess)
+    for sid, event in events.items():
+        reset_maneuver_pipeline_state()
+        record_scan_events(list(events.values()))
+        risk = json.loads(agent_tools.assess_risk.func(sid, miss_distance_m=-1, tca_offset_sec=-1))
+        assert captured["risk"] == (event["tca_offset_sec"], event["miss_distance_m"])
+        assert risk["tca_offset_sec"] == event["tca_offset_sec"]
+
+        reset_maneuver_pipeline_state()
+        record_scan_events(list(events.values()))
+        for other_sid in events:
+            record_risk_assessment(other_sid, {"collision_probability_chan": 1.0 if other_sid == sid else 0.0})
+        json.loads(agent_tools.propose_avoidance_maneuvers.func(sid))
+        search = get_last_maneuver_search()
+        assert search["tca_offset_sec"] == event["tca_offset_sec"]
+        assert search["miss_distance_m"] == event["miss_distance_m"]
 
 
 def test_top_threat_uses_chan_probability_before_miss_distance():

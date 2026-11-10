@@ -149,6 +149,7 @@ def reset_maneuver_pipeline_state() -> None:
 
 
 def record_conjunction_events(events: List[Dict[str, Any]]) -> None:
+    """Record inbox/working events without marking a scan as having run."""
     with _maneuver_lock:
         deduped = {}
         for event in events:
@@ -157,6 +158,21 @@ def record_conjunction_events(events: List[Dict[str, Any]]) -> None:
                 current = deduped.get(int(sid))
                 if current is None or float(event.get("miss_distance_m", float("inf"))) < float(current.get("miss_distance_m", float("inf"))):
                     deduped[int(sid)] = copy.deepcopy(event)
+        _maneuver_pipeline["events"] = copy.deepcopy(deduped)
+
+
+def record_scan_events(events: List[Dict[str, Any]]) -> None:
+    """Store the deduped output of a scan for downstream risk and search."""
+    with _maneuver_lock:
+        deduped = {}
+        for event in events:
+            sid = event.get("secondary_id")
+            if sid is None:
+                continue
+            sid = int(sid)
+            current = deduped.get(sid)
+            if current is None or float(event.get("miss_distance_m", float("inf"))) < float(current.get("miss_distance_m", float("inf"))):
+                deduped[sid] = copy.deepcopy(event)
         _maneuver_pipeline["scan_events"] = deduped
         _maneuver_pipeline["events"] = copy.deepcopy(deduped)
 
