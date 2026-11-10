@@ -13,7 +13,6 @@ import json
 import logging
 import operator
 import queue as queue_module
-import re
 import time
 import socket
 from urllib.parse import urlparse
@@ -46,23 +45,14 @@ from agents.tools import (
     SAFETY_TOOLS,
     SCOUT_TOOLS,
     assess_risk,
-    execute_maneuver_on_satellite,
+    execute_recommended_maneuver,
     get_satellite_status,
     propagate_satellite_orbit,
 )
+from api.state import get_last_maneuver_search, get_recommended_maneuver, reset_maneuver_pipeline_state
 
 logger = logging.getLogger("astro_helix.agents.graph")
 
-
-def _vector_after(label: str, text: str) -> Optional[list[float]]:
-    match = re.search(label + r".*?(\[[^\]]+\])", text or "", flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    try:
-        value = json.loads(match.group(1))
-        return [float(component) for component in value] if isinstance(value, list) and len(value) == 3 else None
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
 
 # ─────────────────────────────────────────────────────────────────────────
 # State
@@ -82,6 +72,7 @@ class AgentState(TypedDict):
     # Event stream for real-time UI updates
     events: Annotated[List[Dict[str, Any]], operator.add]
     pipeline_error: Optional[bool]
+    recommended_maneuver: Optional[Dict[str, Any]]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -219,23 +210,8 @@ def _create_agent_node(
                         result_text = "(duplicate call, result unchanged) " + executed_calls[fingerprint]
                     else:
                         try:
-                            gate_error = None
-                            if agent_name == "safety" and tool_name in {"check_maneuver_feasibility", "check_maneuver_constraints"}:
-                                expected = _vector_after(r"RECOMMENDED MANEUVER:", state.get("planner_output") or "")
-                                supplied = [float(value) for value in args.get("delta_v", [])]
-                                if expected is None or supplied != expected:
-                                    gate_error = {"error": "Delta-v does not exactly match Planner's RECOMMENDED MANEUVER", "expected_delta_v": expected, "supplied_delta_v": supplied, "feasible": False, "overall_pass": False}
-                            if agent_name == "ops_brief" and tool_name == "execute_maneuver_on_satellite":
-                                safety_text = state.get("safety_output") or ""
-                                expected = _vector_after(r"VERDICT:\s*APPROVED.*?(?:delta_v_vector|delta-v vector|vector)", safety_text)
-                                supplied = [float(value) for value in args.get("delta_v", [])]
-                                if not re.search(r"VERDICT:\s*APPROVED", safety_text, flags=re.IGNORECASE) or expected is None or supplied != expected:
-                                    gate_error = {"error": "Execution requires the exact delta_v_vector from an APPROVED Safety verdict", "expected_delta_v": expected, "supplied_delta_v": supplied, "executed": False, "fuel_used_kg": 0.0}
-                            if gate_error:
-                                result_text = json.dumps(gate_error)
-                            else:
-                                result = tools_by_name[tool_name].invoke(args)
-                                result_text = result if isinstance(result, str) else json.dumps(result, default=str)
+                            result = tools_by_name[tool_name].invoke(args)
+                            result_text = result if isinstance(result, str) else json.dumps(result, default=str)
                         except Exception as exc:
                             result_text = json.dumps({"error": str(exc)})
                         executed_calls[fingerprint] = result_text
@@ -266,12 +242,12 @@ def _create_agent_node(
                             "tool": tm.name,
                             "timestamp": time.time(),
                             # Truncate large outputs for event stream
-                            "summary": tm.content[:1200] if tm.name == "execute_maneuver_on_satellite" and isinstance(tm.content, str) else (tm.content[:200] if isinstance(tm.content, str) else str(tm.content)[:200]),
+                            "summary": tm.content[:1200] if tm.name in {"execute_maneuver_on_satellite", "execute_recommended_maneuver"} and isinstance(tm.content, str) else (tm.content[:200] if isinstance(tm.content, str) else str(tm.content)[:200]),
                         }, events)
 
                         # When a maneuver is executed, emit post-maneuver state
                         # so the frontend can update the globe visualization.
-                        if tm.name == "execute_maneuver_on_satellite":
+                        if tm.name in {"execute_maneuver_on_satellite", "execute_recommended_maneuver"}:
                             try:
                                 from api.state import get_satellite as _get_sat
                                 _sat = _get_sat()
@@ -295,6 +271,26 @@ def _create_agent_node(
                             except Exception:
                                 pass
 
+                        if tm.name in {
+                            "record_recommended_maneuver", "check_maneuver_feasibility",
+                            "check_maneuver_constraints", "record_safety_verdict",
+                            "execute_recommended_maneuver", "execute_maneuver_on_satellite",
+                        }:
+                            _emit({
+                                "type": "recommended_maneuver",
+                                "agent": agent_name,
+                                "stage": tm.name,
+                                "recommended_maneuver": get_recommended_maneuver(),
+                                "timestamp": time.time(),
+                            }, events)
+                        if tm.name == "propose_avoidance_maneuvers":
+                            _emit({
+                                "type": "maneuver_search",
+                                "agent": agent_name,
+                                "search": get_last_maneuver_search(),
+                                "timestamp": time.time(),
+                            }, events)
+
         if exhausted_with_tools:
             _emit({"type": "iteration_limit", "agent": agent_name, "timestamp": time.time()}, events)
             _emit({"type": "llm_call", "agent": agent_name, "iteration": max_iterations + 1, "final": True, "timestamp": time.time()}, events)
@@ -308,12 +304,6 @@ def _create_agent_node(
         final_content = msgs[-1].content if msgs and isinstance(msgs[-1], AIMessage) else ""
         if isinstance(final_content, (dict, list)):
             final_content = json.dumps(final_content, default=str)
-        if agent_name == "safety":
-            mismatch = any(isinstance(message, ToolMessage) and "does not exactly match Planner" in str(message.content) for message in msgs)
-            if mismatch:
-                expected = _vector_after(r"RECOMMENDED MANEUVER:", state.get("planner_output") or "")
-                final_content = f"VERDICT: REJECTED; delta_v_vector: {json.dumps(expected)}; Planner recommendation did not match the maneuver reviewed by Safety."
-
         elapsed = time.time() - t0
         _emit({
             "type": "agent_complete",
@@ -338,6 +328,7 @@ def _create_agent_node(
             output_key: final_content,
             "current_agent": next_agent or agent_name,
             "events": events,
+            "recommended_maneuver": get_recommended_maneuver(),
         }
 
     return agent_node
@@ -378,7 +369,7 @@ def build_avoidance_graph(
         llm, config, SAFETY_PROMPT, SAFETY_TOOLS, "safety", "safety_output", "ops_brief",
         event_queue=event_queue,
     )
-    OPS_BRIEF_TOOLS = [assess_risk, execute_maneuver_on_satellite, get_satellite_status, propagate_satellite_orbit]
+    OPS_BRIEF_TOOLS = [assess_risk, execute_recommended_maneuver, get_satellite_status, propagate_satellite_orbit]
     ops_brief_node = _create_agent_node(
         llm, config, OPS_BRIEF_PROMPT, OPS_BRIEF_TOOLS, "ops_brief", "ops_brief", None,
         event_queue=event_queue,
@@ -467,6 +458,7 @@ def run_avoidance_pipeline(
     Returns:
         dict with ops_brief, events, and intermediate outputs
     """
+    reset_maneuver_pipeline_state()
     if mode == "multi":
         graph = build_avoidance_graph(config)
     else:
@@ -482,6 +474,7 @@ def run_avoidance_pipeline(
         "ops_brief": None,
         "events": [],
         "pipeline_error": False,
+        "recommended_maneuver": None,
     }
 
     result = graph.invoke(initial_state, {"recursion_limit": 50})
@@ -493,6 +486,7 @@ def run_avoidance_pipeline(
         "planner_output": result.get("planner_output"),
         "safety_output": result.get("safety_output"),
         "events": result.get("events", []),
+        "recommended_maneuver": result.get("recommended_maneuver"),
     }
 
 
@@ -510,6 +504,7 @@ async def stream_avoidance_pipeline(
     """
     eq: queue_module.Queue = queue_module.Queue()
 
+    reset_maneuver_pipeline_state()
     if mode == "multi":
         graph = build_avoidance_graph(config, event_queue=eq)
     else:
@@ -525,6 +520,7 @@ async def stream_avoidance_pipeline(
         "ops_brief": None,
         "events": [],
         "pipeline_error": False,
+        "recommended_maneuver": None,
     }
 
     done = asyncio.Event()

@@ -1,7 +1,6 @@
 import asyncio
 import json
 import time
-import re
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +11,10 @@ from api.demo_data import DEMO_DEBRIS, load_demo_data
 import api.demo_data as demo_data_module
 from api.state import get_catalog, get_cdm_inbox, get_satellite, reset_state
 from agents.tools import scan_demo_conjunctions
+from api.state import (
+    set_last_maneuver_search, get_recommended_maneuver, get_top_threat,
+    record_conjunction_events, record_risk_assessment,
+)
 
 
 PROMPT = "Analyze threats for ISS using the demo dataset"
@@ -23,33 +26,27 @@ def setup_function():
 
 
 def test_scripted_multi_pipeline_executes_in_order():
-    from langchain_core.tools import tool
-    import agents.graph as graph_module
-
-    @tool("simulate_maneuver_effect")
-    def improved_simulation(secondary_id: int, delta_v: list[float], burn_time_sec: float) -> str:
-        """Return an improving miss distance for the scripted test."""
-        return json.dumps({"before": {"miss_distance_m": 150.0}, "after": {"miss_distance_m": 500.0},
-                           "delta_v_applied": delta_v, "improvement_m": 350.0})
-
-    original_tools = graph_module.PLANNER_TOOLS
-    graph_module.PLANNER_TOOLS = [original_tools[0], improved_simulation, original_tools[2]]
     before = get_satellite().velocity.copy()
-    try:
-        result = run_avoidance_pipeline(PROMPT, config=LLMConfig(provider="scripted"), mode="multi")
-    finally:
-        graph_module.PLANNER_TOOLS = original_tools
+    result = run_avoidance_pipeline(PROMPT, config=LLMConfig(provider="scripted"), mode="multi")
     completed = [e["agent"] for e in result["events"] if e["type"] == "agent_complete"]
     assert completed == ["scout", "analyst", "planner", "safety", "ops_brief"]
+    assert result["recommended_maneuver"]
     assert any(e["type"] == "maneuver_executed" for e in result["events"])
     assert (get_satellite().velocity != before).any()
     assert result["ops_brief"]
-    assert "RECOMMENDED MANEUVER:" in result["planner_output"]
-    assert "VERDICT: APPROVED" in result["safety_output"]
-    safety_dv = json.loads(re.search(r"delta_v_vector:\s*(\[[^\]]+\])", result["safety_output"]).group(1))
+    assert result["recommended_maneuver"]["verdict"] == "APPROVED"
+    stored_dv = result["recommended_maneuver"]["delta_v_vector"]
     execution = next(e for e in result["events"] if e["type"] == "maneuver_executed")
     executed_dv = execution["delta_v"]
-    assert executed_dv == safety_dv
+    assert executed_dv == stored_dv
+    maneuver_events = [e for e in result["events"] if e["type"] == "recommended_maneuver"]
+    assert {e["stage"] for e in maneuver_events} >= {
+        "record_recommended_maneuver", "check_maneuver_feasibility",
+        "check_maneuver_constraints", "record_safety_verdict", "execute_recommended_maneuver",
+    }
+    safety_tools = [e["tool"] for e in result["events"] if e["type"] == "tool_result" and e["agent"] == "safety"]
+    assert safety_tools.count("check_maneuver_feasibility") == 1
+    assert safety_tools.count("check_maneuver_constraints") == 1
     risk_calls = [e for e in result["events"] if e["type"] == "tool_result" and e["tool"] == "assess_risk"]
     assert risk_calls
     assert '3600.0' in risk_calls[0]["summary"]
@@ -193,3 +190,112 @@ def test_status_probe_reports_timeout_as_llm_timeout(monkeypatch):
         status = client.get("/status?probe=1").json()
     assert status["llm"]["llm_reachable"] is False
     assert status["llm"]["error_kind"] == "llm_timeout"
+
+
+def _store_test_recommendation(vector=(0.01, 0.0, 0.0), verdict=None):
+    from agents.tools import record_recommended_maneuver, check_maneuver_feasibility, check_maneuver_constraints, record_safety_verdict
+
+    set_last_maneuver_search({"secondary_id": 90005, "candidates": [{
+        "candidate_index": 0, "delta_v_vector": list(vector), "type": "along-track",
+        "miss_before": 150.0, "miss_after": 1200.0, "burn_time_sec": 0.0,
+        "delta_v_magnitude_ms": float(sum(x * x for x in vector) ** 0.5),
+    }]})
+    stored = json.loads(record_recommended_maneuver.func(90005, 0))["recommended_maneuver"]
+    if verdict:
+        check_maneuver_feasibility.func()
+        check_maneuver_constraints.func()
+        stored = json.loads(record_safety_verdict.func(verdict, "test verdict"))["recommended_maneuver"]
+    return stored
+
+
+def test_safety_checks_and_ops_execute_the_stored_vector():
+    from agents.tools import check_maneuver_feasibility, check_maneuver_constraints, record_safety_verdict, execute_recommended_maneuver
+
+    stored = _store_test_recommendation()
+    feasibility = json.loads(check_maneuver_feasibility.func())
+    constraints = json.loads(check_maneuver_constraints.func())
+    assert feasibility["checked_delta_v_vector"] == stored["delta_v_vector"]
+    assert constraints["checked_delta_v_vector"] == stored["delta_v_vector"]
+    approved = json.loads(record_safety_verdict.func("APPROVED", "both checks passed"))["recommended_maneuver"]
+    before = get_satellite().velocity.copy()
+    result = json.loads(execute_recommended_maneuver.func())
+    assert result["executed"] is True
+    assert result["delta_v"] == approved["delta_v_vector"]
+    assert (get_satellite().velocity - before).tolist() == approved["delta_v_vector"]
+
+
+def test_recommended_execution_refuses_nonapproved_verdict():
+    from agents.tools import execute_recommended_maneuver
+
+    _store_test_recommendation(verdict="REJECTED")
+    before = get_satellite().velocity.copy()
+    result = json.loads(execute_recommended_maneuver.func())
+    assert result["executed"] is False
+    assert result["fuel_used_kg"] == 0.0
+    assert (get_satellite().velocity == before).all()
+
+
+def test_deterministic_search_handles_the_150m_threat():
+    from agents.tools import assess_risk, propose_avoidance_maneuvers
+
+    scan_demo_conjunctions.func()
+    assess_risk.func(90005, miss_distance_m=150.0, tca_offset_sec=3600.0)
+    search = json.loads(propose_avoidance_maneuvers.func(90005))
+    assert search["secondary_id"] == 90005
+    assert search["runtime_sec"] >= 0.0
+    if search["candidates"]:
+        assert len(search["candidates"]) <= 3
+        assert all(candidate["miss_after"] > candidate["miss_before"] for candidate in search["candidates"])
+    else:
+        assert search["no_improving_candidate"] is True
+        assert search["message"] == "no improving candidate within constraints"
+
+
+def test_top_threat_uses_chan_probability_before_miss_distance():
+    record_conjunction_events([
+        {"secondary_id": 90005, "miss_distance_m": 150.0, "tca_offset_sec": 3600.0},
+        {"secondary_id": 90007, "miss_distance_m": 600.0, "tca_offset_sec": 10800.0},
+    ])
+    record_risk_assessment(90005, {"collision_probability_chan": 8e-5, "miss_distance_m": 150.0})
+    record_risk_assessment(90007, {"collision_probability_chan": 1e-2, "miss_distance_m": 600.0})
+    assert get_top_threat()["secondary_id"] == 90007
+
+
+def test_wrong_vector_in_ops_text_cannot_change_stored_execution():
+    from uuid import uuid4
+    import numpy as np
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from agents.graph import _create_agent_node
+    from agents.tools import execute_recommended_maneuver, execute_maneuver_on_satellite
+
+    class WrongVectorModel(BaseChatModel):
+        bound_names: list[str] = []
+
+        @property
+        def _llm_type(self):
+            return "wrong-vector-text-test"
+
+        def bind_tools(self, tools, **kwargs):
+            return self.model_copy(update={"bound_names": [tool.name for tool in tools]})
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            if any(isinstance(message, ToolMessage) and message.name == "execute_recommended_maneuver" for message in messages):
+                reply = AIMessage(content="I propose [999.0, 999.0, 999.0] m/s.")
+            else:
+                reply = AIMessage(content="", tool_calls=[{"name": "execute_recommended_maneuver", "args": {}, "id": str(uuid4()), "type": "tool_call"}])
+            return ChatResult(generations=[ChatGeneration(message=reply)])
+
+    stored = _store_test_recommendation((0.02, 0.0, 0.0), verdict="APPROVED")
+    rejected = json.loads(execute_maneuver_on_satellite.func([999.0, 999.0, 999.0]))
+    assert rejected["executed"] is False
+    before = get_satellite().velocity.copy()
+    node = _create_agent_node(WrongVectorModel(), LLMConfig(provider="scripted", max_iterations=3), "ops", [execute_recommended_maneuver], "ops_brief", "ops_brief")
+    node({
+        "messages": [HumanMessage(content="Execute approved recommendation")], "current_agent": "ops_brief",
+        "scout_output": None, "analyst_output": None, "planner_output": None, "safety_output": "VERDICT: APPROVED",
+        "ops_brief": None, "events": [], "pipeline_error": False, "recommended_maneuver": stored,
+    })
+    assert np.allclose(get_satellite().velocity - before, stored["delta_v_vector"], rtol=0, atol=1e-15)
+    assert get_recommended_maneuver()["delta_v_vector"] == stored["delta_v_vector"]

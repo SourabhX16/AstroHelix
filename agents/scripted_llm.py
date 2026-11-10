@@ -29,6 +29,10 @@ class ScriptedChatModel(BaseChatModel):
     bound_tool_names: list[str] = []
     memory: dict[str, Any] = {}
 
+    def __init__(self, **data: Any):
+        super().__init__(**data)
+        self.memory = {}
+
     @property
     def _llm_type(self) -> str:
         return "astro-helix-scripted"
@@ -44,8 +48,6 @@ class ScriptedChatModel(BaseChatModel):
         data.extend(self.memory.get("_tool_history", []))
         for name, value in data:
             self.memory[name] = value
-        called = {name for name, _ in data} | {name for name, count in calls.items() if count}
-        latest = {name: value for name, value in data}
 
         def call(name: str, args: dict[str, Any] | None = None):
             calls[name] = calls.get(name, 0) + 1
@@ -54,135 +56,99 @@ class ScriptedChatModel(BaseChatModel):
         def finish(text: str):
             return AIMessage(content=text)
 
-        latest = {**self.memory, **latest}
-        threat_data = latest.get("scan_demo_conjunctions", {})
-        events = threat_data.get("events", [])
+        latest = {**self.memory, **{name: value for name, value in data}}
+        scan = latest.get("scan_demo_conjunctions", {})
+        events = scan.get("events", []) if isinstance(scan, dict) else []
         cdms = latest.get("get_pending_cdms", [])
         if isinstance(cdms, dict):
             cdms = cdms.get("cdms", cdms.get("messages", []))
         if not events and isinstance(cdms, list):
             events = cdms
-        events = sorted(events, key=lambda event: (
-            -event.get("collision_probability_chan", event.get("chan_probability", 0.0)),
-            event.get("miss_distance_m", float("inf")),
+        risk_results = [value for name, value in data if name == "assess_risk" and isinstance(value, dict) and not value.get("error")]
+        risk_results.sort(key=lambda value: (
+            -float(value.get("collision_probability_chan", 0.0) or 0.0),
+            float(value.get("miss_distance_m", float("inf"))),
         ))
+        ranked_events = sorted(events, key=lambda event: (
+            -float(event.get("collision_probability_chan", event.get("chan_probability", 0.0)) or 0.0),
+            float(event.get("miss_distance_m", float("inf"))),
+        ))
+        assessed_ids = {int(value["secondary_id"]) for value in risk_results if value.get("secondary_id") is not None}
+        top = risk_results[0] if risk_results else (ranked_events[0] if ranked_events else {})
+        top_id = top.get("secondary_id")
+
         for message in messages:
             if isinstance(message, HumanMessage) and "[Safety review]" in str(message.content):
                 self.memory["safety_final"] = str(message.content).split("[Safety review]", 1)[-1].strip()
             if isinstance(message, HumanMessage) and "[Planner recommendations]" in str(message.content):
                 self.memory["planner_final"] = str(message.content).split("[Planner recommendations]", 1)[-1].strip()
-            if isinstance(message, AIMessage) and isinstance(message.content, str) and (message.content.startswith("APPROVED") or message.content.startswith("REJECTED")):
-                self.memory["safety_final"] = message.content
 
-        if "scan_demo_conjunctions" in names and "scan_demo_conjunctions" not in called:
+        # Scout gathers scan and CDM inputs once.
+        if "scan_demo_conjunctions" in names and "assess_risk" not in names and calls.get("scan_demo_conjunctions", 0) == 0:
             response = call("scan_demo_conjunctions")
-        elif "get_pending_cdms" in names and "get_pending_cdms" not in called:
+        elif "get_pending_cdms" in names and "assess_risk" not in names and calls.get("get_pending_cdms", 0) == 0:
             response = call("get_pending_cdms")
-        elif names == {"get_pending_cdms", "scan_conjunctions", "scan_demo_conjunctions"} and "get_satellite_status" in names and "get_satellite_status" not in called:
-            response = call("get_satellite_status")
-        elif "assess_risk" in names and "execute_maneuver_on_satellite" not in names and "propose_avoidance_maneuvers" not in names and "check_maneuver_constraints" not in names and not any(n == "assess_risk" for n in called):
-            ids = [int(x.get("secondary_id")) for x in events[:5] if x.get("secondary_id") is not None]
-            if not ids and isinstance(cdms, list):
-                ids = [int(x.get("secondary_id")) for x in cdms[:3] if x.get("secondary_id") is not None]
-            response = call("assess_risk", {"secondary_id": ids[0]}) if ids else finish("Missing secondary_id in conjunction data; unable to assess risk.")
-        elif "assess_risk" in names and "execute_maneuver_on_satellite" not in names and "propose_avoidance_maneuvers" not in names and "check_maneuver_constraints" not in names and calls.get("assess_risk", 0) < 3:
-            risk_ids = [x.get("secondary_id") for n, x in data if n == "assess_risk"]
-            ids = [int(x.get("secondary_id")) for x in events[:3] if x.get("secondary_id") is not None]
-            todo = next((sid for sid in ids if sid not in risk_ids), None)
-            if todo:
-                response = call("assess_risk", {"secondary_id": todo})
-            elif "refine_conjunction_hifi" in names and "refine_conjunction_hifi" not in called:
-                sid = risk_ids[0] if risk_ids else (ids[0] if ids else None)
-                response = call("refine_conjunction_hifi", {"secondary_id": int(sid)}) if sid is not None else finish("Missing secondary_id; risk assessments completed without refinement.")
+        # Analyst assesses at most five events in Chan-probability order; no rescans.
+        elif "assess_risk" in names and "propose_avoidance_maneuvers" not in names and "record_safety_verdict" not in names and "execute_recommended_maneuver" not in names:
+            next_event = next((event for event in ranked_events[:5] if int(event.get("secondary_id", -1)) not in assessed_ids), None)
+            if next_event is not None:
+                response = call("assess_risk", {"secondary_id": int(next_event["secondary_id"]), "miss_distance_m": float(next_event.get("miss_distance_m", 0.0)), "tca_offset_sec": float(next_event.get("tca_offset_sec", next_event.get("tca_sec", 0.0)))})
             else:
-                response = finish("Risk assessments completed for the available top threats.")
-        elif "refine_conjunction_hifi" in names and "refine_conjunction_hifi" not in called:
-            risk = next((x for n, x in data if n == "assess_risk"), {})
-            sid = risk.get("secondary_id") or (events[0].get("secondary_id") if events else None)
-            response = call("refine_conjunction_hifi", {"secondary_id": int(sid)}) if sid is not None else finish("Missing secondary_id; high-fidelity refinement was not possible.")
-        elif "propose_avoidance_maneuvers" in names and "propose_avoidance_maneuvers" not in called:
-            risk = next((x for n, x in data if n == "assess_risk"), {})
-            event = events[0] if events else {}
-            sid = risk.get("secondary_id", event.get("secondary_id"))
-            miss = risk.get("miss_distance_m", event.get("miss_distance_m"))
-            tca = event.get("tca_offset_sec", event.get("tca_sec"))
-            if sid is None or miss is None or tca is None:
-                response = finish("Missing secondary_id, miss_distance_m, or tca_offset_sec; unable to propose a maneuver.")
-            else:
-                response = call("propose_avoidance_maneuvers", {"secondary_id": int(sid), "tca_offset_sec": float(tca), "miss_distance_m": float(miss)})
-        elif "get_satellite_status" in names and "check_maneuver_constraints" in names and "get_satellite_status" not in called:
-            response = call("get_satellite_status")
-        elif "check_maneuver_constraints" in names and "RECOMMENDED MANEUVER: none" in self.memory.get("planner_final", ""):
-            response = finish("VERDICT: REJECTED; delta_v_vector: [] (no candidate increased miss distance).")
-        elif "check_maneuver_constraints" in names:
-            candidates = latest.get("propose_avoidance_maneuvers", {}).get("candidates", [])
-            candidates = [c for c in candidates if c.get("delta_v_magnitude_ms", 999) <= 50.0]
-            candidate = next((c for c in candidates if c.get("delta_v_vector") == self.memory.get("chosen_delta_v")), None)
-            candidate = candidate or max(candidates, key=lambda c: c.get("miss_improvement_m", 0), default={})
-            dv = candidate.get("delta_v_vector")
-            if dv is None:
-                response = finish("Missing candidate delta_v; no maneuver can be reviewed.")
-            elif "check_maneuver_constraints" not in called:
-                response = call("check_maneuver_constraints", {"delta_v": dv, "burn_time_sec": float(candidate.get("burn_time_sec", 0.0))})
-            elif "check_maneuver_feasibility" in names and "check_maneuver_feasibility" not in called:
-                response = call("check_maneuver_feasibility", {"delta_v": dv})
-            else:
-                checks = [x for n, x in data if n in {"check_maneuver_constraints", "check_maneuver_feasibility"}]
-                approved = all(x.get("feasible", True) and x.get("overall_pass", True) for x in checks)
-                verdict = ("VERDICT: APPROVED" if approved else "VERDICT: REJECTED") + f"; delta_v_vector: {json.dumps(dv)}; checks: {checks}"
-                if "execute_maneuver_on_satellite" in names and approved and "execute_maneuver_on_satellite" not in called:
-                    self.memory["safety_final"] = verdict
-                    response = call("execute_maneuver_on_satellite", {"delta_v": dv})
-                elif "execute_maneuver_on_satellite" in names and "execute_maneuver_on_satellite" in called:
-                    response = call("assess_risk", {"secondary_id": int(latest.get("propose_avoidance_maneuvers", {}).get("secondary_id", 0))}) if "assess_risk" not in called else finish("Operator brief: approved simulated maneuver executed. " + verdict)
+                response = finish("Risk assessment completed for the top available events.")
+        # Planner searches only the leading threat, then stores an index rather than a vector.
+        elif "propose_avoidance_maneuvers" in names:
+            if calls.get("propose_avoidance_maneuvers", 0) == 0:
+                if top_id is None:
+                    response = finish("No ranked threat is available; no maneuver search was performed.")
                 else:
-                    response = finish(verdict)
-        elif "execute_maneuver_on_satellite" in names:
-            safety_text = self.memory.get("safety_final", "")
-            import re
-            match = re.search(r"delta_v_vector:\s*(\[[^\]]+\])", safety_text)
-            try:
-                dv = json.loads(match.group(1)) if match else None
-            except json.JSONDecodeError:
-                dv = None
-            if "VERDICT: APPROVED" in safety_text and dv is not None and "execute_maneuver_on_satellite" not in called:
-                response = call("execute_maneuver_on_satellite", {"delta_v": dv})
-            elif "VERDICT: APPROVED" in safety_text and "execute_maneuver_on_satellite" in called and calls.get("assess_risk", 0) == 0:
-                sid_match = re.search(r"RECOMMENDED MANEUVER:\s*(\d+)", self.memory.get("planner_final", ""))
-                response = call("assess_risk", {"secondary_id": int(sid_match.group(1))}) if sid_match else finish("Operator brief: approved simulated maneuver executed; target secondary ID unavailable.")
-            elif "VERDICT: APPROVED" in safety_text and "assess_risk" in called:
-                response = finish("Operator brief: approved simulated maneuver executed and post-burn risk assessed.")
+                    response = call("propose_avoidance_maneuvers", {"secondary_id": int(top_id)})
             else:
-                response = finish("Operator brief: maneuver rejected or not approved; no execution performed.")
-        elif "get_satellite_status" in names and "execute_maneuver_on_satellite" in called and "get_satellite_status" not in called:
-            response = call("get_satellite_status")
-        elif "scan_conjunctions" in names and "scan_demo_conjunctions" not in names and "scan_conjunctions" not in called:
+                search = latest.get("propose_avoidance_maneuvers", {})
+                candidates = search.get("candidates", []) if isinstance(search, dict) else []
+                sid = int(search.get("secondary_id", top_id or 0)) if isinstance(search, dict) else int(top_id or 0)
+                if search.get("no_improving_candidate") or not candidates:
+                    response = finish(f"Top threat {sid}: no improving candidate within constraints. No maneuver recommended.")
+                elif "record_recommended_maneuver" in names and calls.get("record_recommended_maneuver", 0) == 0:
+                    response = call("record_recommended_maneuver", {"secondary_id": sid, "candidate_index": int(candidates[0].get("candidate_index", 0))})
+                else:
+                    response = finish(f"Top threat {sid} has a stored improving candidate. See the recommended_maneuver record.")
+        # Safety checks and verdict operate entirely on the stored record.
+        elif "record_safety_verdict" in names:
+            if calls.get("get_satellite_status", 0) == 0:
+                response = call("get_satellite_status")
+            elif calls.get("check_maneuver_feasibility", 0) == 0:
+                response = call("check_maneuver_feasibility")
+            elif calls.get("check_maneuver_constraints", 0) == 0:
+                response = call("check_maneuver_constraints")
+            elif calls.get("record_safety_verdict", 0) == 0:
+                feasibility = latest.get("check_maneuver_feasibility", {})
+                constraints = latest.get("check_maneuver_constraints", {})
+                approved = feasibility.get("feasible") is True and constraints.get("overall_pass") is True
+                verdict = "APPROVED" if approved else "REJECTED"
+                response = call("record_safety_verdict", {"verdict": verdict, "reason": "Both checks passed for the stored recommended maneuver." if approved else "One or more stored-vector safety checks failed."})
+            else:
+                record_result = latest.get("record_safety_verdict", {})
+                record = record_result.get("recommended_maneuver", {})
+                verdict = record.get("verdict", "REJECTED")
+                response = finish(f"VERDICT: {verdict}. Safety checks were run against the stored recommended maneuver.")
+        # Ops calls the argument-free executor only after stored approval, then assesses that target once.
+        elif "execute_recommended_maneuver" in names:
+            verdict_result = latest.get("record_safety_verdict", {})
+            record = verdict_result.get("recommended_maneuver", {})
+            verdict = record.get("verdict")
+            if verdict == "APPROVED" and calls.get("execute_recommended_maneuver", 0) == 0:
+                response = call("execute_recommended_maneuver")
+            elif verdict == "APPROVED" and calls.get("assess_risk", 0) == 0:
+                response = call("assess_risk", {"secondary_id": int(record["secondary_id"])})
+            elif verdict == "APPROVED" and calls.get("get_satellite_status", 0) == 0:
+                response = call("get_satellite_status")
+            elif verdict == "APPROVED":
+                response = finish(f"Operator brief: stored maneuver for secondary {record.get('secondary_id')} executed and risk reassessed.")
+            else:
+                response = finish("Operator brief: Safety did not approve a stored maneuver; no execution occurred.")
+        elif "scan_conjunctions" in names and "scan_demo_conjunctions" not in names and calls.get("scan_conjunctions", 0) == 0:
             response = call("scan_conjunctions")
-        elif "simulate_maneuver_effect" in names and latest.get("propose_avoidance_maneuvers", {}).get("candidates"):
-            candidates = latest["propose_avoidance_maneuvers"]["candidates"]
-            simulations = [x for n, x in data if n == "simulate_maneuver_effect"]
-            simulated_vectors = {tuple(x.get("delta_v_applied", x.get("delta_v", []))) for x in simulations}
-            cand = next((c for c in candidates[:3] if tuple(c.get("delta_v_vector", [])) not in simulated_vectors), None)
-            sid = latest["propose_avoidance_maneuvers"].get("secondary_id")
-            if sid is not None and cand:
-                response = call("simulate_maneuver_effect", {"secondary_id": int(sid), "delta_v": cand["delta_v_vector"], "burn_time_sec": float(cand.get("burn_time_sec", 0.0))})
-            else:
-                best_sim = max(simulations, key=lambda x: x.get("after", {}).get("miss_distance_m", 0.0), default={})
-                best_candidate = next((c for c in candidates[:3] if c.get("delta_v_vector") == best_sim.get("delta_v_applied")), {})
-                if best_candidate and best_sim.get("after", {}).get("miss_distance_m", 0.0) > best_sim.get("before", {}).get("miss_distance_m", 0.0):
-                    dv = best_candidate["delta_v_vector"]
-                    self.memory["chosen_delta_v"] = dv
-                    response = finish(f"RECOMMENDED MANEUVER: {sid}, {best_candidate.get('type')}, {json.dumps(dv)}, miss_before={best_sim['before']['miss_distance_m']}, miss_after={best_sim['after']['miss_distance_m']}")
-                else:
-                    response = finish("RECOMMENDED MANEUVER: none; no candidate increases the miss distance.")
-        elif "check_maneuver_constraints" in names and not self.memory.get("planner_final", "").count("RECOMMENDED MANEUVER:"):
-            response = finish("VERDICT: REJECTED; delta_v_vector: [] (Planner supplied no safe recommendation).")
         else:
-            outputs = {"scout": "Threats ranked from the demo conjunction scan.", "analyst": "Risk assessed for the leading conjunctions.", "planner": "Selected the best available candidate within the maneuver limit.", "safety": "APPROVED: maneuver passed the available constraint checks.", "ops_brief": "Operator brief: approved simulated maneuver executed.", "astro_helix": "Analysis complete using the deterministic demo policy."}
-            role = "astro_helix"
-            for candidate in ("scout", "analyst", "planner", "safety", "ops_brief"):
-                if (candidate == "scout" and "scan_demo_conjunctions" in names) or (candidate == "analyst" and "assess_risk" in names and "propose_avoidance_maneuvers" not in names) or (candidate == "planner" and "propose_avoidance_maneuvers" in names) or (candidate == "safety" and "check_maneuver_constraints" in names) or (candidate == "ops_brief" and "execute_maneuver_on_satellite" in names):
-                    role = candidate
-                    break
-            response = finish(outputs[role])
+            response = finish("Analysis complete using the deterministic demo policy.")
+
         return ChatResult(generations=[ChatGeneration(message=response)])

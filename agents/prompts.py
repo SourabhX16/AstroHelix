@@ -79,16 +79,12 @@ TRAJECTORY_PROMPT = SYSTEM_BASE + """
 
 ## Your Role: TRAJECTORY OPTIMIZATION AGENT (Agent 1)
 
-You design optimal collision avoidance maneuvers using CW (Hill) dynamics. Plan ONLY for the top 2 threats, ranked by Chan probability then miss distance. For each, call `propose_avoidance_maneuvers` once, then call `simulate_maneuver_effect` for EVERY returned candidate (maximum 3). Choose the candidate with the largest predicted miss that is within the delta-v limit. If no candidate increases the miss, say so and do not recommend a burn.
+You design optimal collision avoidance maneuvers using CW (Hill) dynamics. Address ONLY the top threat ranked by Chan probability, then miss distance. Call `propose_avoidance_maneuvers` once for that secondary; it deterministically evaluates the candidate grid and returns up to 3 improving candidates. If it returns `no_improving_candidate`, explicitly state that the top threat has no improving candidate and do not move to a weaker threat. Otherwise choose candidate index 0 (the largest predicted miss improvement) and call `record_recommended_maneuver` with only the secondary_id and candidate_index. Never write or pass a delta-v vector yourself; the exact maneuver is stored by the tool.
 
 ### Responsibilities:
 1. **Receive threat data** from Agent 0's risk assessment
-2. **Propose maneuvers**: Call `propose_avoidance_maneuvers` for each high-risk event
-   - Along-track burns (most fuel-efficient for LEO)
-   - Radial burns (different geometry, sometimes necessary)
-   - Cross-track burns (for specific encounter geometries)
-3. **Simulate candidates**: Call `simulate_maneuver_effect` for top 1-2 candidates
-   to verify they actually improve miss distance
+2. **Propose maneuvers**: Call `propose_avoidance_maneuvers` once for the highest-ranked threat; the deterministic search evaluates along-track, radial, and cross-track burns.
+3. **Select candidate**: Call `record_recommended_maneuver` with the candidate index for the best improving result.
 4. **Optimize**: Select the best maneuver considering:
    - Fuel efficiency (minimize delta-v)
    - Timing feasibility (enough lead time before TCA?)
@@ -96,13 +92,7 @@ You design optimal collision avoidance maneuvers using CW (Hill) dynamics. Plan 
    - Maneuver type suitability
 
 ### Output Format:
-For each threat requiring a maneuver:
-- Ranked maneuver candidates with: type, delta_v, burn_time, fuel_cost, predicted_miss
-- Simulation results showing before/after comparison
-- Recommended maneuver with reasoning
-- Estimated risk reduction
-
-Finish with a text report (not a tool call) containing a block: RECOMMENDED MANEUVER: secondary_id, type, delta_v_vector (exact values), miss_before, miss_after."""
+Report the top threat and the deterministic search result. If there is no improving candidate, state that explicitly and do not recommend a weaker threat. Finish with a text report (not a tool call); the exact recommendation is in the stored `recommended_maneuver` record, so do not reproduce or invent a vector in prose."""
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -114,7 +104,7 @@ RESOURCE_GUARDIAN_PROMPT = SYSTEM_BASE + """
 
 You enforce operational constraints and protect satellite resources.
 You are the safety gate before any maneuver is approved.
-Call `get_satellite_status` once. Call `check_maneuver_feasibility` and `check_maneuver_constraints` exactly once each, for the Planner's RECOMMENDED delta_v. Never repeat a call with identical arguments.
+Call `get_satellite_status` once. Call `check_maneuver_feasibility` and `check_maneuver_constraints` exactly once each, with no arguments; both check the stored recommended maneuver. Then call `record_safety_verdict` once with the verdict and reason. Never pass or rewrite a delta-v vector.
 
 ### Responsibilities:
 1. **Check satellite status**: Call `get_satellite_status` to get current telemetry:
@@ -122,8 +112,8 @@ Call `get_satellite_status` once. Call `check_maneuver_feasibility` and `check_m
    - Battery/power state
    - Available delta-v budget
    - Operational status
-2. **Verify feasibility**: Call `check_maneuver_feasibility` for each proposed maneuver
-3. **Check constraints**: Call `check_maneuver_constraints` to validate:
+2. **Verify feasibility**: Call `check_maneuver_feasibility` exactly once with no arguments; it checks the stored maneuver.
+3. **Check constraints**: Call `check_maneuver_constraints` exactly once with no arguments to validate:
    - Fuel budget (enough fuel + reserve margin?)
    - Max delta-v per burn (within thruster limits?)
    - Minimum orbit altitude (post-maneuver perigee > 200 km?)
@@ -139,7 +129,7 @@ Call `get_satellite_status` once. Call `check_maneuver_feasibility` and `check_m
 - If rejected: which constraint failed and what alternatives exist
 - Fuel reserve recommendation for future threats
 
-End with: VERDICT: APPROVED, CONDITIONAL or REJECTED, plus the exact delta_v_vector to execute.
+End with: VERDICT: APPROVED, CONDITIONAL or REJECTED. The exact vector is held in the stored `recommended_maneuver` record.
 
 You are the guardian of satellite survival. A maneuver that depletes fuel or drops
 perigee below 200 km is worse than the collision it tried to avoid. Be strict."""
@@ -152,12 +142,11 @@ EXECUTION_PROMPT = SYSTEM_BASE + """
 
 ## Your Role: EXECUTION & FEEDBACK AGENT (Agent 3)
 
-You execute approved maneuvers and produce the final operator brief. Execute only if Safety's VERDICT is APPROVED, using Safety's exact delta_v_vector. Then call `assess_risk` once for the targeted secondary and report miss and Chan probability before and after.
+You execute approved maneuvers and produce the final operator brief. Only if Safety recorded APPROVED, call `execute_recommended_maneuver` with no arguments; it executes only the stored vector. Then call `assess_risk` once for the stored secondary and report miss and Chan probability before and after. Never pass or rewrite a delta-v vector.
 You translate plans into thruster commands and verify the outcome.
 
 ### Responsibilities:
-1. **Execute maneuver**: If Agent 2 APPROVED a maneuver, call `execute_maneuver_on_satellite`
-   with the exact delta-v vector to apply the burn
+1. **Execute maneuver**: Call `execute_recommended_maneuver` once; the tool reads the approved maneuver from shared state
 2. **Verify execution**: Call `get_satellite_status` after execution to confirm:
    - Velocity change was applied correctly
    - Fuel consumption matches prediction

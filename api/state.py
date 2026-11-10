@@ -7,6 +7,7 @@ Thread-safe singleton pattern for use by both API routes and agent tools.
 from __future__ import annotations
 
 import threading
+import copy
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -128,6 +129,92 @@ _catalog: Optional[OrbitalCatalog] = None
 _satellite: Optional[Satellite] = None
 _cdm_inbox: Optional[CDMInbox] = None
 _init_lock = threading.Lock()
+_maneuver_lock = threading.RLock()
+_maneuver_pipeline: Dict[str, Any] = {
+    "events": {}, "risk_assessments": {}, "last_search": None,
+    "recommended_maneuver": None, "checks": {},
+}
+
+
+def reset_maneuver_pipeline_state() -> None:
+    """Clear handoff and threat records at the start of an agent run."""
+    with _maneuver_lock:
+        _maneuver_pipeline.update({
+            "events": {}, "risk_assessments": {}, "last_search": None,
+            "recommended_maneuver": None, "checks": {},
+        })
+
+
+def record_conjunction_events(events: List[Dict[str, Any]]) -> None:
+    with _maneuver_lock:
+        for event in events:
+            sid = event.get("secondary_id")
+            if sid is not None:
+                current = _maneuver_pipeline["events"].get(int(sid))
+                if current is None or float(event.get("miss_distance_m", float("inf"))) < float(current.get("miss_distance_m", float("inf"))):
+                    _maneuver_pipeline["events"][int(sid)] = copy.deepcopy(event)
+
+
+def record_risk_assessment(secondary_id: int, assessment: Dict[str, Any]) -> None:
+    with _maneuver_lock:
+        _maneuver_pipeline["risk_assessments"][int(secondary_id)] = copy.deepcopy(assessment)
+
+
+def get_top_threat() -> Optional[Dict[str, Any]]:
+    with _maneuver_lock:
+        ranked = []
+        for sid, event in _maneuver_pipeline["events"].items():
+            risk = _maneuver_pipeline["risk_assessments"].get(sid, {})
+            probability = risk.get("collision_probability_chan", event.get("collision_probability_chan", event.get("chan_probability", 0.0)))
+            ranked.append((float(probability or 0.0), float(event.get("miss_distance_m", float("inf"))), sid, event, risk))
+        if not ranked:
+            return None
+        probability, miss, sid, event, risk = sorted(ranked, key=lambda row: (-row[0], row[1]))[0]
+        result = copy.deepcopy(event)
+        result.update({"secondary_id": sid, "miss_distance_m": miss, "collision_probability_chan": probability})
+        if risk:
+            result["risk_assessment"] = copy.deepcopy(risk)
+        return result
+
+
+def set_last_maneuver_search(search: Dict[str, Any]) -> None:
+    with _maneuver_lock:
+        _maneuver_pipeline["last_search"] = copy.deepcopy(search)
+
+
+def get_last_maneuver_search() -> Optional[Dict[str, Any]]:
+    with _maneuver_lock:
+        return copy.deepcopy(_maneuver_pipeline["last_search"])
+
+
+def set_recommended_maneuver(record: Optional[Dict[str, Any]]) -> None:
+    with _maneuver_lock:
+        _maneuver_pipeline["recommended_maneuver"] = copy.deepcopy(record)
+        _maneuver_pipeline["checks"] = {}
+
+
+def get_recommended_maneuver() -> Optional[Dict[str, Any]]:
+    with _maneuver_lock:
+        return copy.deepcopy(_maneuver_pipeline["recommended_maneuver"])
+
+
+def update_recommended_maneuver(**updates: Any) -> Optional[Dict[str, Any]]:
+    with _maneuver_lock:
+        record = _maneuver_pipeline["recommended_maneuver"]
+        if record is None:
+            return None
+        record.update(copy.deepcopy(updates))
+        return copy.deepcopy(record)
+
+
+def record_maneuver_check(name: str, result: Dict[str, Any]) -> None:
+    with _maneuver_lock:
+        _maneuver_pipeline["checks"][name] = copy.deepcopy(result)
+
+
+def get_maneuver_checks() -> Dict[str, Any]:
+    with _maneuver_lock:
+        return copy.deepcopy(_maneuver_pipeline["checks"])
 
 
 def get_catalog() -> OrbitalCatalog:
@@ -171,3 +258,4 @@ def reset_state() -> None:
         _catalog = None
         _satellite = None
         _cdm_inbox = None
+    reset_maneuver_pipeline_state()
