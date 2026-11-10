@@ -288,6 +288,20 @@ def test_deterministic_search_handles_the_150m_threat():
     if search["candidates"]:
         assert len(search["candidates"]) <= 3
         assert all(candidate["miss_after"] > candidate["miss_before"] for candidate in search["candidates"])
+        chosen = search["candidates"][0]
+        assert chosen["delta_v_ms"] <= 0.35
+        assert chosen["fuel_required_kg"] >= 0
+        assert {"miss_before", "miss_after", "chan_after"} <= chosen.keys()
+        assert chosen["miss_after"] >= float(__import__("os").getenv("TARGET_MISS_M", "2000"))
+        from agents import tools as agent_tools
+        sat = get_satellite()
+        obj = get_catalog().get(90005)
+        smaller = agent_tools.propagate_state(
+            sat.position, sat.velocity + __import__("numpy").array(chosen["delta_v_vector"]) * 0.99,
+            search["tca_offset_sec"], dt=2.0,
+        )
+        secondary = agent_tools.propagate_state(obj.position, obj.velocity, search["tca_offset_sec"], dt=2.0)
+        assert __import__("numpy").linalg.norm(smaller.r - secondary.r) < chosen["miss_after"]
     else:
         assert search["no_improving_candidate"] is True
         assert search["message"] == "no improving candidate within constraints"

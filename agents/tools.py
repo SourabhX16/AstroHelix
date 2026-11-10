@@ -272,30 +272,23 @@ def propose_avoidance_maneuvers(secondary_id: int) -> str:
     max_dv = effective_max_dv_mps()
     target_miss = float(os.getenv("TARGET_MISS_M", "2000"))
     magnitudes = sorted({float(value) for value in (0.02, 0.05, 0.1, 0.2, max_dv) if 0 < value <= max_dv})
-    # Resolve the TCA neighborhood to keep the grid search focused on the event.
-    duration_sec = min(86400.0, max(600.0, float(tca_offset_sec) + 300.0))
     def evaluate(maneuver_type, direction, magnitude):
-            dv = (direction * magnitude).tolist()
-            constraints = check_constraints(
-                delta_v=dv, primary_position=sat.position, primary_velocity=sat.velocity,
-                mass_kg=sat.total_mass, isp_s=sat.config.isp_s,
-                remaining_fuel_kg=sat.fuel_kg, burn_time_sec=0.0, max_dv_mps=max_dv,
-            )
-            if not constraints["overall_pass"] or not constraints["constraints"]["no_secondary_conjunctions"]["pass"]:
-                return None
-            result = simulate_maneuver(
-                primary_pos=sat.position, primary_vel=sat.velocity,
-                secondary_pos=obj.position, secondary_vel=obj.velocity,
-                delta_v=dv, burn_time_sec=0.0, duration_sec=duration_sec,
-            )
-            before = float(miss_distance_m)
-            p = propagate_state(sat.position, sat.velocity + direction * magnitude, tca_offset_sec, dt=2.0)
-            s = propagate_state(obj.position, obj.velocity, tca_offset_sec, dt=2.0)
-            after = float(np.linalg.norm(p.r - s.r))
-            improvement = after - before
-            if improvement > 0:
-                fuel = sat.total_mass * (1 - np.exp(-magnitude / (sat.config.isp_s * 9.80665)))
-                return {
+        dv = (direction * magnitude).tolist()
+        constraints = check_constraints(
+            delta_v=dv, primary_position=sat.position, primary_velocity=sat.velocity,
+            mass_kg=sat.total_mass, isp_s=sat.config.isp_s,
+            remaining_fuel_kg=sat.fuel_kg, burn_time_sec=0.0, max_dv_mps=max_dv,
+        )
+        if not constraints["overall_pass"] or not constraints["constraints"]["no_secondary_conjunctions"]["pass"]:
+            return None
+        before = float(miss_distance_m)
+        p = propagate_state(sat.position, sat.velocity + direction * magnitude, tca_offset_sec, dt=2.0)
+        s = propagate_state(obj.position, obj.velocity, tca_offset_sec, dt=2.0)
+        after = float(np.linalg.norm(p.r - s.r))
+        improvement = after - before
+        if improvement > 0:
+            fuel = sat.total_mass * (1 - np.exp(-magnitude / (sat.config.isp_s * 9.80665)))
+            return {
                     "type": maneuver_type,
                     "delta_v_vector": dv,
                     "delta_v_magnitude_ms": round(magnitude, 4),
@@ -307,8 +300,8 @@ def propose_avoidance_maneuvers(secondary_id: int) -> str:
                     "constraints": constraints,
                     "delta_v_ms": round(magnitude, 4), "fuel_required_kg": round(float(fuel), 4),
                     "chan_after": float(top.get("collision_probability_chan", 0.0)),
-                }
-            return None
+            }
+        return None
     best_partial = None
     sufficient = []
     for maneuver_type, direction in directions:
