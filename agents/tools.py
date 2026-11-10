@@ -577,14 +577,27 @@ def execute_recommended_maneuver() -> str:
                 p = propagate_state(sat.position, sat.velocity, offset, dt=2.0)
                 s = propagate_state(obj.position, obj.velocity, offset, dt=2.0)
                 return float(np.linalg.norm(p.r - s.r))
-            predicted = float(recommended.get("miss_after", 0.0))
+            search = get_last_maneuver_search()
+            candidates = search.get("candidates", [])
+            candidate_index = int(recommended.get("candidate_index", 0))
+            predicted = float(
+                candidates[candidate_index].get("predicted_miss_distance_m", candidates[candidate_index].get("miss_after", 0.0))
+                if candidate_index < len(candidates)
+                else recommended.get("miss_after", 0.0)
+            )
             actual = miss_at(tca)
             samples = [miss_at(max(0.0, tca + offset)) for offset in range(-300, 301, 10)]
+            discrepancy = abs(actual - predicted) / max(abs(predicted), 1.0)
             verification = {
                 "predicted_miss_at_original_tca_m": predicted,
                 "actual_miss_at_original_tca_m": actual,
                 "minimum_miss_within_300s_m": min(samples),
-                "discrepancy_flag": abs(actual - predicted) / max(abs(predicted), 1.0) > 0.15,
+                "discrepancy_fraction": discrepancy,
+                "discrepancy_flag": discrepancy > 0.15,
+                "discrepancy_reason": (
+                    "Predicted miss came from the maneuver search propagation; actual miss re-propagates from the executed satellite state and can differ because of propagation/model and state-update effects."
+                    if discrepancy > 0.15 else None
+                ),
             }
         update_recommended_maneuver(executed=True, fuel_used_kg=result["fuel_used_kg"], execution=result, post_burn_verification=verification)
         result["post_burn_verification"] = verification

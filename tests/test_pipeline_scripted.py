@@ -309,6 +309,42 @@ def test_deterministic_search_handles_the_150m_threat():
         assert search["message"] == "no improving candidate within constraints"
 
 
+def test_150m_threat_execution_returns_post_burn_miss_verification():
+    from agents.tools import (
+        check_maneuver_constraints,
+        check_maneuver_feasibility,
+        assess_risk,
+        execute_recommended_maneuver,
+        propose_avoidance_maneuvers,
+        record_recommended_maneuver,
+        record_safety_verdict,
+    )
+    from api.state import get_last_maneuver_search
+
+    scan_demo_conjunctions.func()
+    assess_risk.func(90005, miss_distance_m=150.0, tca_offset_sec=3600.0)
+    search_result = json.loads(propose_avoidance_maneuvers.func(90005))
+    assert search_result["secondary_id"] == 90005
+    assert search_result["candidates"]
+    record_recommended_maneuver.func(90005, 0)
+    check_maneuver_feasibility.func()
+    check_maneuver_constraints.func()
+    approved = json.loads(record_safety_verdict.func("APPROVED", "test approval"))
+    assert approved["recommended_maneuver"]["verdict"] == "APPROVED"
+
+    result = json.loads(execute_recommended_maneuver.func())
+    verification = result["post_burn_verification"]
+    search = get_last_maneuver_search()
+    assert result["executed"] is True
+    assert search["secondary_id"] == 90005
+    assert verification["predicted_miss_at_original_tca_m"] == search["candidates"][0]["predicted_miss_distance_m"]
+    assert verification["actual_miss_at_original_tca_m"] > 0
+    assert verification["minimum_miss_within_300s_m"] > 0
+    assert isinstance(verification["discrepancy_flag"], bool)
+    if verification["discrepancy_flag"]:
+        assert verification["discrepancy_reason"]
+
+
 def test_search_reports_partial_and_no_improving_candidate(monkeypatch):
     from agents import tools as agent_tools
     from api.state import record_risk_assessment
