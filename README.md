@@ -108,7 +108,7 @@ An on-board deployment is future scope and is not implemented or tested in this 
 
 ## Team
 
-- <name> — <role>
-- <name> — <role>
-- <name> — <role>
-- <name> — <role>
+- <Sourabh Patne> — <role>
+- <Saloni Jain> — <role>
+- <Shlok Pandey> — <role>
+- <Tanisha Rai> — <role>
